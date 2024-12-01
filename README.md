@@ -18,12 +18,12 @@ You can ues most of the estimator in sklearn in MLkit and implement auto standar
 ___
 ## Installation
 ### Dependencies
-<pre><code>   
+<pre><code>
 'numpy >= 1.16.4',
 </code></pre>
 ### User installation
 - download: https://github.com/WellJoea/CellCloudX.git
-<pre><code>   
+<pre><code>
 cd CellCloudX
 pip install .
 </code></pre>
