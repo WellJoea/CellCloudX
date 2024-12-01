@@ -1,5 +1,5 @@
 <p align="center">
-  <img height="150" src="https://github.com/WellJoea/CellCloudX/tree/main/docs/images/cellcloudx.svg" />
+  <img height="150" src="https://github.com/WellJoea/CellCloudX/blob/main/docs/images/cellcloudx.svg" />
 </p>
 
 ______________________________________________________________________
