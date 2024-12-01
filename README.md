@@ -25,6 +25,5 @@ ___
 - download: https://github.com/WellJoea/CellCloudX.git
 - cd CellCloudX
 - pip install .
-
-___
+  
 ## useage
