@@ -22,8 +22,12 @@ ___
         'numpy >= 1.16.4',
 </code></pre>
 ### User installation
+<pre><code>   
 - download: https://github.com/WellJoea/CellCloudX.git
 - cd CellCloudX
 - pip install .
   
+</code></pre>
+
+
 ## useage
