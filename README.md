@@ -19,14 +19,13 @@ ___
 ## Installation
 ### Dependencies
 <pre><code>   
-        'numpy >= 1.16.4',
+'numpy >= 1.16.4',
 </code></pre>
 ### User installation
-<pre><code>   
 - download: https://github.com/WellJoea/CellCloudX.git
-- cd CellCloudX
-- pip install .
-  
+<pre><code>   
+cd CellCloudX
+pip install .
 </code></pre>
 
 
