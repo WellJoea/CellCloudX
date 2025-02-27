@@ -26,6 +26,7 @@
   - 3D distortion smoothing and correction
   - Interpolation
 - ​**Data Analysis**
+  - Cell Tracer
   - Spatially Variable Gene (SVG) calculation
   - Cell-cell communication analysis
   - Data integration & Clustering
