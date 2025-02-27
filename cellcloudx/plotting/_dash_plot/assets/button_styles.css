@@ -1,0 +1,5 @@
+/* 按压时变绿色 */
+.custom-active-button:active {
+    background-color: #afb2b4 !important;
+    transform: scale(1.0); /* 可选：添加按压缩放效果 */
+}
