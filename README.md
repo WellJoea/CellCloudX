@@ -51,5 +51,5 @@ pip install .
 **Quick Start**
 ```
 import cellcloudx as cc
-comming soon
+coming soon
 ```
