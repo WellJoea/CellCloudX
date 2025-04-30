@@ -39,7 +39,17 @@
 Python >= 3.10
 numpy >= 2.0.1
 torch >= 2.0
-
+scikit-image >= 0.19.3
+antspyx >=  0.4.2
+SimpleITK >= 2.1.0
+pyvista >= 0.43.7
+pykeops >=2.1.0
+ipywidgets
+trame
+vtk
+scanpy
+matplotlib
+dash_bootstrap_components
 ```
 ### Install from Source
 ```bash
