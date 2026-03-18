@@ -1,0 +1,84 @@
+Metadata-Version: 2.4
+Name: cellcloudx
+Version: 1.2.2
+Summary: CellCloudX - a toolkit for analyzing spatial multi-omics data.
+Home-page: 
+Author: Wei Zhou
+Author-email: welljoea@gmail.com
+Maintainer: Wei Zhou
+Requires-Dist: numpy>=1.21
+Requires-Dist: torch>=2.0
+Requires-Dist: scikit-image>=0.19.3
+Requires-Dist: antspyx>=0.4.2
+Requires-Dist: SimpleITK>=2.1.0
+Requires-Dist: pyvista>=0.43.7
+Requires-Dist: pykeops>=2.1.0
+Requires-Dist: ipywidgets
+Requires-Dist: trame
+Requires-Dist: vtk
+Requires-Dist: scanpy
+Requires-Dist: matplotlib
+Requires-Dist: pyStackReg
+Requires-Dist: dash_bootstrap_components
+Dynamic: author
+Dynamic: author-email
+Dynamic: description
+Dynamic: maintainer
+Dynamic: requires-dist
+Dynamic: summary
+
+<p align="center">
+  <img height="200" src="https://github.com/WellJoea/CellCloudX/blob/main/docs/images/cellcloudx.svg">
+</p>
+
+<h1 align="center">CellCloudX - Spatial Multi-Omics Registration Toolkit</h1>
+
+[![Linting Status][linting-image]][linting-url]
+[![Docs Status][docs-image]][docs-url]
+[![Contributing][contributing-image]][contributing-url]
+[![Slack][slack-image]][slack-url]
+
+---
+
+**[Documentation](https://cellcloudx.readthedocs.io)**​ | ​**[Tutorials]()**​ | ​**[GitHub Repo](https://github.com/WellJoea/CellCloudX.git)**
+
+**CellCloudX**​ is a unified computational framework for spatial multi-omics data processing and analysis.
+
+## Key Features
+- ​**Spatial Registration**
+  - Spatial omics registration
+  - Point cloud registration
+  - Image registration
+- ​**3D Reconstruction**
+  - 3D reconstruction
+  - Surface reconstruction
+  - 3D distortion smoothing and correction
+  - Interpolation
+- ​**Data Analysis**
+  - Spatially Variable Gene (SVG) calculation
+  - Cell-cell communication analysis
+  - Data integration & Clustering
+- **Omics visualization**
+---
+
+## Installation
+
+### Dependencies
+```bash
+Python >= 3.10
+numpy >= 2.0.1
+torch >= 2.0
+
+```
+### Install from Source
+```bash
+git clone https://github.com/WellJoea/CellCloudX.git
+cd CellCloudX
+pip install .
+```
+
+**Quick Start**
+```
+import cellcloudx as cc
+coming soon
+```
