@@ -1,0 +1,10 @@
+numpy >= 1.21
+torch >= 2.0
+scikit-image
+SimpleITK 
+pyvista
+pykeops >=2.3.0
+trame
+vtk
+scanpy
+matplotlib
