@@ -1,5 +1,5 @@
 import inspect
-def clean_cache(*array, iter=3, reset=None):
+def clean_cache0(*array, iter=3, reset=None):
     if len(array): #TODO
         for var_name in array:
             caller_globals = inspect.currentframe().f_back.f_globals
@@ -34,6 +34,74 @@ def clean_cache(*array, iter=3, reset=None):
         gc.collect()
         i += 1
 
+def clean_cache(*var_names, iters=3, reset_peak=False, device=None, verbose=False):
+    import gc
+    import inspect
+
+    if len(var_names):
+        frame = inspect.currentframe().f_back
+        try:
+            caller_locals = frame.f_locals
+            caller_globals = frame.f_globals
+
+            for name in var_names:
+                if not isinstance(name, str):
+                    if verbose:
+                        print(f"Skip non-string argument: {name!r}")
+                    continue
+
+                removed = False
+
+                if name in caller_locals:
+                    try:
+                        del caller_locals[name]
+                        removed = True
+                    except Exception:
+                        pass
+
+                if name in caller_globals:
+                    try:
+                        del caller_globals[name]
+                        removed = True
+                    except Exception:
+                        pass
+
+                if verbose and not removed:
+                    print(f"Variable '{name}' not found in caller scope.")
+        finally:
+            del frame
+
+    # Python 
+    for _ in range(iters):
+        n = gc.collect()
+        if verbose:
+            print(f"gc.collect() -> {n}")
+        if n == 0:
+            break
+
+    # CUDA cache 
+    try:
+        import torch as th
+        if th.cuda.is_available():
+            th.cuda.empty_cache()
+
+            if reset_peak:
+                if device is None:
+                    th.cuda.reset_peak_memory_stats()
+                else:
+                    th.cuda.reset_peak_memory_stats(device)
+
+    except Exception as e:
+        if verbose:
+            print(f"CUDA cleanup skipped: {e}")
+
+    #  gc
+    for _ in range(iters):
+        n = gc.collect()
+        if verbose:
+            print(f"gc.collect() -> {n}")
+        if n == 0:
+            break
 
 def get_memory(device):
     if hasattr(device, 'type'):

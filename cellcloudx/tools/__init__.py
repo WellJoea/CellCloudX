@@ -21,3 +21,5 @@ from ..tools._DEG import DiffExp
 # from ..alignment.ccflib.fpfh import FPFH
 from ..tools._allen_ccf import *
 from . import (_label_predict)
+from ._pc_mesh import pc_mesh, save_mesh, densify_volume_points, clay_mesh
+from ._mesh_recon import clay_slice_mesh, clay_mesh, grid_point_cloud, grid_to_mesh, points_to_image, image_to_nrrd

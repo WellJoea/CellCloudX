@@ -1,6 +1,10 @@
 import numpy as np
 import functools
 
+import re
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
 from sklearn.metrics.pairwise import euclidean_distances
 from ._transi import swap_tmat
 from ._similarity_transform import SimilarityTransform
@@ -97,40 +101,117 @@ class XpWrapper:
 def npto2v(xp):
     return XpWrapper(xp)
 
-def homotransform_estimate(src, dst, transformer='rigid', **kwargs):
-    '''
-    Y, TY
-    '''
+def homotransform_estimate(
+    src,
+    dst,
+    transformer='rigid',
+    sample=None,
+    random_state=0,
+    **kwargs,
+):
+    """
+    Estimate a homogeneous transformation.
+
+    Parameters
+    ----------
+    sample : None, float or int
+        None or 1 : use all paired points.
+        0 < sample < 1 : sample this fraction of paired points.
+        sample > 1 : sample this number of paired points.
+    random_state : int or None
+        Random seed used for sampling.
+
+    Returns
+    -------
+    model
+        Estimated transformation model.
+    """
+    import numpy as np
     import skimage.transform as skitf
+
     TRANS = {
-        'rigid':skitf.EuclideanTransform,
-        'euclidean':skitf.EuclideanTransform,
-        'E':skitf.EuclideanTransform,
-        'similarity':SimilarityTransform,
-        'S':SimilarityTransform,
-        'isosimilarity':SimilarityTransform,
-        'O':SimilarityTransform,
-        'affine':skitf.AffineTransform, #6
-        'A':skitf.AffineTransform, #6
-        'projective':skitf.ProjectiveTransform, # 8
-        'P':skitf.ProjectiveTransform, # 8
-        'homography':skitf.ProjectiveTransform,
-        'piecewise-affine':skitf.PiecewiseAffineTransform,
+        'rigid': skitf.EuclideanTransform,
+        'euclidean': skitf.EuclideanTransform,
+        'E': skitf.EuclideanTransform,
+        'similarity': SimilarityTransform,
+        'S': SimilarityTransform,
+        'isosimilarity': SimilarityTransform,
+        'O': SimilarityTransform,
+        'affine': skitf.AffineTransform,
+        'A': skitf.AffineTransform,
+        'projective': skitf.ProjectiveTransform,
+        'P': skitf.ProjectiveTransform,
+        'homography': skitf.ProjectiveTransform,
+        'piecewise-affine': skitf.PiecewiseAffineTransform,
         'fundamental': skitf.FundamentalMatrixTransform,
         'essential': skitf.EssentialMatrixTransform,
         'polynomial': skitf.PolynomialTransform,
     }
 
-    assert src.shape == dst.shape
-    D = src.shape[1]
-    if transformer in ['S','similarity']:
-        kwargs.update(dict(isoscale = False))
-    elif transformer in ['O', 'isosimilarity']:
-        kwargs.update(dict(isoscale = True))
+    src = np.asarray(src)
+    dst = np.asarray(dst)
 
-    model= TRANS[transformer](dimensionality=D, **kwargs)
-    model.estimate(src, dst)
+    if src.shape != dst.shape:
+        raise ValueError(
+            f"src.shape={src.shape} and dst.shape={dst.shape} must be equal."
+        )
+
+    if src.ndim != 2:
+        raise ValueError("src and dst must be two-dimensional arrays.")
+
+    if transformer not in TRANS:
+        raise ValueError(f"Unknown transformer: {transformer!r}.")
+
+    D = src.shape[1]
+    N = src.shape[0]
+
+    if transformer in ['S', 'similarity']:
+        kwargs.update(isoscale=False)
+    elif transformer in ['O', 'isosimilarity']:
+        kwargs.update(isoscale=True)
+
+    if sample is None or sample == 1:
+        src_fit = src
+        dst_fit = dst
+    else:
+        if not isinstance(sample, (int, float, np.integer, np.floating)):
+            raise TypeError(
+                "sample must be None, a fraction in (0, 1], "
+                "or an integer greater than 1."
+            )
+
+        sample = float(sample)
+
+        if 0 < sample < 1:
+            n_sample = max(1, int(np.ceil(N * sample)))
+        elif sample > 1 and sample.is_integer():
+            n_sample = min(int(sample), N)
+        else:
+            raise ValueError(
+                "sample must be None, a fraction in (0, 1], "
+                "or an integer greater than 1."
+            )
+
+        if n_sample < N:
+            rng = np.random.default_rng(random_state)
+            sample_idx = np.sort(
+                rng.choice(N, size=n_sample, replace=False)
+            )
+            src_fit = src[sample_idx]
+            dst_fit = dst[sample_idx]
+        else:
+            src_fit = src
+            dst_fit = dst
+
+    model_class = TRANS[transformer]
+    if hasattr(model_class, 'from_estimate') and (not transformer in ['S', 'similarity', 'O', 'isosimilarity']):
+        model = model_class.from_estimate( src_fit, dst_fit, **kwargs)
+    else:
+        # Compatible with scikit-image < 0.26
+        model = TRANS[transformer](dimensionality=D, **kwargs)
+        model.estimate(src_fit, dst_fit)
     return model
+
 
 def cscale_vertices(vertices, rescale):
     '''
@@ -260,6 +341,12 @@ def rbf_kernal(X, Y, h2, use_keops=True, xp=None):
     return dist2
 
 def ccf_transform_point(Y, paras, inverse=False,  use_keops=True, return_each=False, **kargs):
+    paras = tuple(paras)
+    if any(para.get('transformer') == 'M' for para in paras):
+        return ccf_transform_point_diffeo(
+            Y, paras, inverse=inverse, use_keops=use_keops,
+            return_each=return_each, **kargs
+        )
     TY = Y.copy()
     D = Y.shape[1]
     TYs = []
@@ -284,6 +371,42 @@ def ccf_transform_point(Y, paras, inverse=False,  use_keops=True, return_each=Fa
     if return_each:
         return TYs
     return TY
+
+def ccf_transform_point_diffeo(Y, paras, inverse=False,  use_keops=None, return_each=False, **kargs):
+    TY = Y.clone() if hasattr(Y, 'detach') else Y.copy()
+    D = Y.shape[1]
+    TYs = []
+    ordered_paras = reversed(paras) if inverse else paras
+    for para in ordered_paras:
+        if 'tform' in para:
+            tform = para['tform']
+            assert tform.shape == (D+1, D+1)
+            TY = homotransform_point(TY, tform, inverse=inverse, **kargs)
+        else:
+            transformer = para.get('transformer')
+            if transformer in ('K', 'U', 'V', 'M'):
+                from ..alignment.m3lib.pairwise_diffeomorphism_registration import (
+                    transform_diffeomorphic_points,
+                )
+                TY = transform_diffeomorphic_points(
+                    TY, para, inverse=inverse, use_keops=use_keops, **kargs
+                )
+            elif inverse:
+                raise ValueError('inverse is not supported for non-homotransform.')
+            elif transformer == 'D':
+                legacy_keops = True if use_keops is None else use_keops
+                TY = ccf_deformable_transform_point(TY, **para, use_keops=legacy_keops, **kargs)
+            elif transformer == 'H':
+                legacy_keops = True if use_keops is None else use_keops
+                TY = ccf_hierarchical_transform_point(TY, **para, use_keops=legacy_keops, **kargs)
+            else:
+                raise ValueError('transformer must be an uppercase code supported by PWR.')
+        if return_each:
+            TYs.append(TY.clone() if hasattr(TY, 'detach') else TY.copy())
+    if return_each:
+        return TYs
+    return TY
+
 
 def ccf_deformable_transform_point(Yt, W=None, Y=None, Ym=0, Ys=1, Xm=0, Xs=1, beta=1, 
                                      G=None, Q=None, U=None, S=None, dtype=None,
@@ -357,9 +480,9 @@ def ccf_hierarchical_transform_point(Yt, W=None, Y=None, Ym=0, Ys=1, Xm=0, Xs=1,
     else:
         assert A.shape == (D, D), 'The shape of A must be (D, D).'
     
-    (Yt, W, Y, Ym, Ys, Xm, Xs, beta, Q, S, G, t) = \
+    (Yt, W, Y, Ym, Ys, Xm, Xs, beta, Q, S, G, t, A) = \
         [ th.asarray(i, dtype=dtype, device=device) if not i is None else None
-            for i in [Yt, W, Y, Ym, Ys, Xm, Xs, beta, Q, S, G, t]]
+            for i in [Yt, W, Y, Ym, Ys, Xm, Xs, beta, Q, S, G, t, A]]
     Y_d = (Yt -Ym)/Ys # TODO: add center Y
 
     if (G is None) and ((U is None) and (Q is None)) and (S is None):
@@ -476,7 +599,7 @@ def homotransform_mat(transformer, D, R=None, s=None, t=None, A=None,
         t = xp.zeros(D, dtype=dtype, device=device)
     t = xp.asarray(t, dtype=dtype, device=device)
 
-    if transformer in 'ESRTILO':
+    if transformer in 'ESRTILON':
         if s is None:
             s = xp.eye(D, dtype=dtype, device=device)
         s = xp.asarray(s, dtype=dtype, device=device)
@@ -603,3 +726,286 @@ def trans_masklabel(mask, points, space=None,method='nearest', bounds_error=Fals
     grid_p = (np.arange(w), np.arange(h), np.arange(d))
     label = interpn(grid_p, mask, points, method=method, bounds_error=bounds_error, fill_value=fill_value, **kargs)
     return label
+
+
+
+def principal_R(points, axis_order="auto", *, solver="eigh"):
+    """Align PCA axes while preserving distances and the original centroid.
+
+    Parameters
+    ----------
+    points : (N, D) array_like
+        Nonempty finite real coordinates. Input coordinates are not modified.
+    axis_order : str, default="auto"
+        The i-th integer gives the 1-based target coordinate axis of PC_i;
+        PCs are ordered by decreasing variance. For example, "312" maps
+        PC1 to z, PC2 to x, and PC3 to y.
+
+        "auto" maximizes the total absolute alignment in a global one-to-one
+        assignment between PCA axes and coordinate axes. It does not force
+        PC1 onto x, or establish anatomical correspondence between clouds.
+
+        Compact permutations, e.g. "312", are accepted for D <= 9. Commas,
+        whitespace, semicolons, or vertical bars separate arbitrary-D orders,
+        e.g. "1,2,3,4,5,6,7,8,9,10". Literal ellipses are not accepted.
+    solver : {"eigh", "svd"}, keyword-only, default="eigh"
+        "eigh" diagonalizes the D x D scatter matrix and is efficient for
+        large N and small D. "svd" decomposes centered coordinates directly,
+        avoiding the conditioning loss from forming the scatter matrix.
+        Its SVD includes all D right singular vectors even when N < D.
+
+    Returns
+    -------
+    R : (D + 1, D + 1) ndarray
+        Homogeneous rigid transform for column vectors. For row-stored points,
+        use points @ R[:D, :D].T + R[:D, D]. The rotation has determinant +1.
+    Tpoints : (N, D) ndarray
+        Float64 transformed points, evaluated around the centroid to reduce
+        cancellation from a large translation term.
+
+    Notes
+    -----
+    Principal axes are not uniquely determined within repeated-eigenvalue
+    subspaces. Near-repeated eigenvalues can also make directions sensitive
+    to noise. SVD cannot remove this intrinsic PCA ambiguity.
+
+    Signs initially favor the positive target axes. If necessary, one axis
+    with the weakest target-axis alignment is flipped to ensure det = +1.
+    Hence all positive directions and a proper rotation cannot always both
+    be retained. For a fixed axis assignment, this flip minimizes trace loss.
+
+    A singleton or an all-identical cloud returns the identity transform.
+    Temporary scalar normalization is undone when producing Tpoints; it is
+    not a normalization of the output coordinates.
+    """
+    if np.iscomplexobj(points):
+        raise ValueError("points must contain real coordinates.")
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or 0 in points.shape:
+        raise ValueError("points must have shape (N, D) with N >= 1 and D >= 1.")
+    if not np.isfinite(points).all():
+        raise ValueError("points must contain only finite coordinates.")
+    if not isinstance(axis_order, str):
+        raise TypeError("axis_order must be a string.")
+    if solver not in ("eigh", "svd"):
+        raise ValueError("solver must be 'eigh' or 'svd'.")
+
+    N, D = points.shape
+    key = axis_order.strip().lower()
+    mapping = None
+    if key != "auto":
+        tokens = (
+            list(key) if D <= 9 and key.isdigit() and len(key) == D
+            else [s for s in re.split(r"[\s,;|]+", key) if s]
+        )
+        if not tokens or not all(s.isdigit() for s in tokens):
+            raise ValueError("axis_order contains invalid characters.")
+        order = np.asarray([int(s) for s in tokens])
+        if order.size != D or not np.array_equal(np.sort(order), np.arange(1, D + 1)):
+            raise ValueError(f"axis_order must be a permutation of axes 1 to {D}.")
+        mapping = order - 1
+
+    # Offset-based centering improves summation for clouds far from the origin.
+    # Fall back to a scaled mean if subtraction of extreme coordinates overflows.
+    with np.errstate(over="ignore", invalid="ignore"):
+        delta = points - points[0]
+    if np.isfinite(delta).all():
+        center = points[0] + (delta / N).sum(axis=0)
+    else:
+        center = (points / N).sum(axis=0)
+    del delta
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        centered = points - center
+    if not np.isfinite(centered).all():
+        raise ValueError("Centered coordinates exceed the float64 range; rescale the input.")
+
+    scale = np.max(np.abs(centered))
+    if scale == 0:
+        return np.eye(D + 1), points.copy()
+
+    # Uniform numerical scaling protects the scatter matrix from overflow.
+    centered /= scale
+    if solver == "eigh":
+        _, axes = np.linalg.eigh(centered.T @ centered)
+        axes = axes[:, ::-1]  # eigh returns eigenvalues in ascending order.
+    else:
+        _, _, vt = np.linalg.svd(centered, full_matrices=(N < D))
+        axes = vt.T
+
+    if mapping is None:
+        target_idx, pc_idx = linear_sum_assignment(-np.abs(axes))
+        mapping = np.empty(D, dtype=int)
+        mapping[pc_idx] = target_idx
+
+    rotation = np.empty((D, D), dtype=np.float64)
+    rotation[mapping] = axes.T
+    diagonal = np.diag(rotation).copy()
+    rotation *= np.where(diagonal < 0, -1.0, 1.0)[:, None]
+    if np.linalg.det(rotation) < 0:
+        rotation[np.argmin(np.abs(diagonal))] *= -1
+
+    R = np.eye(D + 1)
+    R[:D, :D] = rotation
+    R[:D, D] = center - rotation @ center
+
+    Tpoints = centered @ rotation.T
+    Tpoints *= scale
+    Tpoints += center
+    return R, Tpoints
+
+
+def extract_ratate2(tmat, axes=(0, 1), pure_rotation=True):
+    """Extract a coordinate-plane transform into a 4x4 matrix.
+
+    Parameters
+    ----------
+    tmat : array-like, shape (4, 4)
+        Input 3D homogeneous affine transformation matrix.
+    axes : sequence of two distinct integers
+        Ordered coordinate axes selected from 0, 1, and 2.
+    pure_rotation : bool, default True
+        True: use the nearest rotation confined to the selected plane,
+        measured in Frobenius norm.
+        False: preserve the selected 2x2 affine block unchanged.
+
+    Returns
+    -------
+    ntmat : ndarray, shape (4, 4)
+        Selected plane transform with all three translations preserved.
+        The remaining coordinate has an identity linear transform.
+    """
+    tmat = np.asarray(tmat, dtype=float)
+    idx = np.ix_(axes, axes)
+    block = tmat[idx].copy()
+
+    if pure_rotation:
+        angle = np.arctan2(
+            block[1, 0] - block[0, 1],
+            block[0, 0] + block[1, 1],
+        )
+        c, s = np.cos(angle), np.sin(angle)
+        block = np.array([[c, -s], [s, c]])
+
+    ntmat = np.eye(4)
+    ntmat[idx] = block
+    ntmat[:3, 3] = tmat[:3, 3]
+
+    return ntmat
+
+def principal_R0(points, axis_order='auto'):
+    """
+    Align the principal axes of an N x D point cloud.
+
+    Parameters
+    ----------
+    points : (N, D) array
+        Input point cloud.
+
+    axis_order : str
+        'auto':
+            Match each principal axis to its nearest coordinate axis.
+
+        Compact permutation for D <= 9:
+            '12345', '31524', etc.
+
+        Delimited permutation for arbitrary D:
+            '1,2,3,4,5'
+            '1 2 3 4 5'
+            '1,2,...,10'
+
+        The i-th number specifies the target coordinate axis of PC_i.
+
+    Returns
+    -------
+    R : (D+1, D+1) array
+        Homogeneous transformation matrix.
+
+    Tpoints : (N, D) array
+        Transformed point cloud.
+    """
+    points = np.asarray(points, dtype=np.float64)
+
+    if points.ndim != 2 or points.shape[0] == 0:
+        raise ValueError("points must have shape (N, D).")
+
+    N, D = points.shape
+    center = points.mean(axis=0)
+    centered = points - center
+
+    # PCA axes stored as columns, ordered by decreasing variance
+    values, axes = np.linalg.eigh(centered.T @ centered)
+    axes = axes[:, np.argsort(values)[::-1]]
+
+    if not isinstance(axis_order, str):
+        raise TypeError("axis_order must be a string.")
+
+    axis_order = axis_order.strip().lower()
+
+    if axis_order == 'auto':
+        # Coordinate-axis index -> PCA-axis index
+        target_idx, pc_idx = linear_sum_assignment(-np.abs(axes))
+
+        # PCA-axis index -> target coordinate-axis index
+        mapping = np.empty(D, dtype=int)
+        mapping[pc_idx] = target_idx
+
+    else:
+        # Compact form: '31524'
+        if D <= 9 and axis_order.isdigit() and len(axis_order) == D:
+            order = np.array(
+                [int(i) for i in axis_order],
+                dtype=int,
+            )
+
+        # Delimited form: '3,1,5,2,4' or '3 1 5 2 4'
+        else:
+            tokens = [
+                i for i in re.split(r'[\s,;|]+', axis_order)
+                if i
+            ]
+
+            if not all(i.isdigit() for i in tokens):
+                raise ValueError("axis_order contains invalid characters.")
+
+            order = np.array(tokens, dtype=int)
+
+        if (
+            order.size != D
+            or not np.array_equal(
+                np.sort(order),
+                np.arange(1, D + 1),
+            )
+        ):
+            raise ValueError(
+                f"axis_order must be a permutation of axes 1 to {D}."
+            )
+
+        # Convert 1-based axis numbers to 0-based indices
+        mapping = order - 1
+
+    rotation = np.zeros((D, D), dtype=np.float64)
+    scores = np.zeros(D, dtype=np.float64)
+
+    for pc, target in enumerate(mapping):
+        axis = axes[:, pc]
+
+        # Orient toward the positive target coordinate axis
+        sign = 1.0 if axis[target] >= 0 else -1.0
+        rotation[target] = sign * axis
+        scores[target] = abs(axis[target])
+
+    # Ensure a proper rotation rather than reflection
+    if np.linalg.det(rotation) < 0:
+        rotation[np.argmin(scores)] *= -1
+
+    # Rotate around the original point-cloud center
+    translation = center - rotation @ center
+
+    R = np.eye(D + 1)
+    R[:D, :D] = rotation
+    R[:D, D] = translation
+
+    Tpoints = points @ rotation.T + translation
+
+    return R, Tpoints

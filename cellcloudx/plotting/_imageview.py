@@ -87,9 +87,9 @@ def qview(*arrays, layout=None,
                     dtypes.append('loc')
                 elif (ii.ndim >=2) and ii.shape[1] >2:
                     dtypes.append('image')
-    elif (isinstance(dtypes), str):
+    elif (isinstance(dtypes, str)):
         dtypes = [dtypes] * ncells
-    elif (isinstance(dtypes), list):
+    elif (isinstance(dtypes, list)):
         assert len(dtypes) >= ncells
         dtypes = dtypes[:ncells]
 
@@ -127,6 +127,8 @@ def qview(*arrays, layout=None,
                                 size=int(n_len*sample), 
                                 replace=False, p=None)
                 arrs_spl.append(ida[idex])
+            else:
+                arrs_spl.append(ida)
         arrs = arrs_spl
 
     fig, axs = plt.subplots(nrows, ncols,
@@ -340,6 +342,9 @@ def drawMatches(pairlist, bgs=None,
                     icolor = rngc.random(3)
                 else: 
                     icolor = line_color[i]
+                    if len(icolor) == len(rpair):
+                        icolor = icolor[k]
+   
                 con = ConnectionPatch(xyA=xy1, xyB=xy2, coordsA="data", 
                                       coordsB="data", axesA=rax, axesB=qax, 
                                       alpha=line_alpha,
@@ -502,6 +507,7 @@ def imagemappoint(image, points, figsize=(7,7), size=1, color='red',
                   origin = 'upper', 
                   swap_xy = True,
                   equal_aspect=True,
+                  sample=None,
                 grid=False,
                 axis_off=False,
                 ticks_off=False,
@@ -525,6 +531,7 @@ def imagemappoint(image, points, figsize=(7,7), size=1, color='red',
                 legend_color='black',
                 show=True,
                 tick_nbins=5,
+                seed= 0,
                 alpha=1, ax=None, fig = None, iargs = {}, **kargs):
     #import matplotlib
     #Redb = matplotlib.colors.LinearSegmentedColormap.from_list("Redb", ['white', 'red'])
@@ -557,6 +564,11 @@ def imagemappoint(image, points, figsize=(7,7), size=1, color='red',
             pointxy =points[:,[1,0]]
         else:
             pointxy =points
+        if sample is None:
+            assert 0 < sample<=1, "sample must be a float between 0 and 1"
+            np.random.seed(seed)
+            kidx = np.random.choice(pointxy.shape[0], int(round(pointxy.shape[0]*sample, 0)), replace=False)
+            pointxy = pointxy[kidx] 
         ip = ax.scatter(pointxy[:,0], pointxy[:,1], s=size, c=color, 
                          vmin= p_vmin, vmax=p_vmax,
                         edgecolor=edgecolor, alpha=alpha, marker=marker, **kargs)

@@ -10,7 +10,2019 @@ import scipy.sparse as ssp
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-def slice_knn(Xs, knn=8, ks=1, radius=None,kd_method='annoy',CI=0.99, disable=True):
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import seaborn as sns
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+
+def barplot3d(
+    data,
+    x='Time',
+    y='knn',
+    z='4_normal',
+    hue='group',
+    x_order=None,
+    y_order=None,
+    hue_order=None,
+    palette=None,
+    aggfunc='mean',
+
+    # 画布与三轴比例
+    figsize=(13, 8),
+    box_aspect=(1.1, 1.1, 1.1,),
+
+    # 视角
+    elev=25,
+    azim=-55,
+    roll=0,
+
+    # 柱体大小
+    bar_width=0.32,
+    bar_depth=0.68,
+
+    # 间距
+    group_gap=0.05,
+    x_gap=0.30,
+    y_gap=0.25,
+
+    # 柱体样式
+    baseline=0,
+    alpha=0.88,
+    edgecolor=',,',
+    linewidth=0.6,
+    shade=True,
+    bar_kwargs=None,
+
+    # 坐标轴
+    xlabel=None,
+    ylabel=None,
+    zlabel=None,
+    labelpad=(12, 10, 8),
+    xtick_rotation=30,
+    zlim=None,
+
+    # 图例
+    legend=True,
+    legend_kwargs=None,
+
+    # 输出
+    save=None,
+    dpi=1200,
+    show=True,
+):
+    """
+    绘制三维分类柱状图。
+
+    Parameters
+    ----------
+    bar_width : float
+        每根柱子沿 x 轴方向的宽度。
+    bar_depth : float
+        每根柱子沿 y 轴方向的深度。
+    group_gap : float
+        同一个 x 类别内，不同 hue 柱子之间的间距。
+    x_gap : float
+        相邻 x 类别柱组之间的间距。
+    y_gap : float
+        相邻 y 类别之间的间距。
+    figsize : tuple
+        Matplotlib 画布的宽和高。
+    box_aspect : tuple
+        三维坐标框的 x、y、z 长宽高比例。
+    """
+
+    def get_order(values, order=None):
+        if order is not None:
+            return list(order)
+
+        observed = values.dropna()
+
+        if isinstance(values.dtype, pd.CategoricalDtype):
+            observed_set = set(observed)
+            return [
+                value
+                for value in values.cat.categories
+                if value in observed_set
+            ]
+
+        order = observed.drop_duplicates().tolist()
+
+        if pd.api.types.is_numeric_dtype(values):
+            order = sorted(order)
+
+        return order
+
+    required = [x, y, z, hue]
+    missing = [
+        column for column in required
+        if column not in data.columns
+    ]
+
+    if missing:
+        raise KeyError(f'Missing columns: {missing}')
+
+    if bar_width <= 0 or bar_depth <= 0:
+        raise ValueError(
+            'bar_width and bar_depth must be positive.'
+        )
+
+    if min(group_gap, x_gap, y_gap) < 0:
+        raise ValueError(
+            'group_gap, x_gap and y_gap must be non-negative.'
+        )
+
+    plot_data = data[required].dropna().copy()
+
+    x_order = get_order(plot_data[x], x_order)
+    y_order = get_order(plot_data[y], y_order)
+    hue_order = get_order(plot_data[hue], hue_order)
+
+    if not x_order or not y_order or not hue_order:
+        raise ValueError('No data remain for plotting.')
+
+    plot_df = (
+        plot_data
+        .groupby(
+            [x, y, hue],
+            observed=True,
+            sort=False
+        )[z]
+        .agg(aggfunc)
+        .rename('_height')
+        .reset_index()
+        .dropna(subset=['_height'])
+    )
+
+    xmap = {
+        value: index
+        for index, value in enumerate(x_order)
+    }
+    ymap = {
+        value: index
+        for index, value in enumerate(y_order)
+    }
+    hmap = {
+        value: index
+        for index, value in enumerate(hue_order)
+    }
+
+    plot_df['_xi'] = plot_df[x].map(xmap)
+    plot_df['_yi'] = plot_df[y].map(ymap)
+    plot_df['_hi'] = plot_df[hue].map(hmap)
+
+    plot_df = plot_df.dropna(
+        subset=['_xi', '_yi', '_hi']
+    )
+
+    if plot_df.empty:
+        raise ValueError(
+            'No rows match x_order, y_order and hue_order.'
+        )
+
+    if palette is None:
+        tab10 = plt.get_cmap('tab10')
+        color_map = {
+            value: tab10(index % tab10.N)
+            for index, value in enumerate(hue_order)
+        }
+
+    elif isinstance(palette, dict):
+        missing_colors = [
+            value for value in hue_order
+            if value not in palette
+        ]
+
+        if missing_colors:
+            raise KeyError(
+                f'Missing palette colors for: {missing_colors}'
+            )
+
+        color_map = {
+            value: palette[value]
+            for value in hue_order
+        }
+
+    else:
+        palette = list(palette)
+
+        if len(palette) == 0:
+            raise ValueError('palette cannot be empty.')
+
+        color_map = {
+            value: palette[index % len(palette)]
+            for index, value in enumerate(hue_order)
+        }
+
+    # 同一个 x 类别内，全部 hue 柱体占据的总宽度
+    group_span = (
+        len(hue_order) * bar_width
+        + (len(hue_order) - 1) * group_gap
+    )
+
+    x_step = group_span + x_gap
+    y_step = bar_depth + y_gap
+
+    xi = plot_df['_xi'].to_numpy(dtype=float)
+    yi = plot_df['_yi'].to_numpy(dtype=float)
+    hi = plot_df['_hi'].to_numpy(dtype=float)
+    height = plot_df['_height'].to_numpy(dtype=float)
+
+    bx = (
+        xi * x_step
+        + hi * (bar_width + group_gap)
+    )
+    by = yi * y_step
+    bz = np.full_like(height, float(baseline))
+
+    colors = [
+        color_map[value]
+        for value in plot_df[hue]
+    ]
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+
+    options = dict(
+        color=colors,
+        alpha=alpha,
+        edgecolor=edgecolor,
+        linewidth=linewidth,
+        shade=shade,
+        antialiased=True
+    )
+    options.update(bar_kwargs or {})
+
+    ax.bar3d(
+        bx,
+        by,
+        bz,
+        np.full_like(height, bar_width),
+        np.full_like(height, bar_depth),
+        height - baseline,
+        **options
+    )
+
+    # 刻度放在每组柱体中心
+    xticks = (
+        np.arange(len(x_order)) * x_step
+        + group_span / 2
+    )
+    yticks = (
+        np.arange(len(y_order)) * y_step
+        + bar_depth / 2
+    )
+
+    ax.set_xticks(xticks)
+    ax.set_xticklabels(
+        x_order,
+        rotation=xtick_rotation,
+        ha='right'
+    )
+
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(y_order)
+
+    ax.set_xlim(
+        -x_gap / 2,
+        (len(x_order) - 1) * x_step
+        + group_span
+        + x_gap / 2
+    )
+
+    ax.set_ylim(
+        -y_gap / 2,
+        (len(y_order) - 1) * y_step
+        + bar_depth
+        + y_gap / 2
+    )
+
+    if zlim is None:
+        zmin = min(
+            float(baseline),
+            float(np.nanmin(height))
+        )
+        zmax = max(
+            float(baseline),
+            float(np.nanmax(height))
+        )
+
+        zrange = zmax - zmin
+        margin = 0.08 * (zrange if zrange > 0 else 1)
+
+        ax.set_zlim(zmin, zmax + margin)
+
+    else:
+        ax.set_zlim(*zlim)
+
+    ax.set_xlabel(
+        x if xlabel is None else xlabel,
+        labelpad=labelpad[0]
+    )
+    ax.set_ylabel(
+        y if ylabel is None else ylabel,
+        labelpad=labelpad[1]
+    )
+    ax.set_zlabel(
+        z if zlabel is None else zlabel,
+        labelpad=labelpad[2]
+    )
+
+    ax.view_init(
+        elev=elev,
+        azim=azim,
+        roll=roll
+    )
+
+    ax.set_box_aspect(box_aspect)
+
+    if legend:
+        handles = [
+            Patch(
+                facecolor=color_map[value],
+                edgecolor=edgecolor,
+                linewidth=linewidth,
+                alpha=alpha,
+                label=value
+            )
+            for value in hue_order
+        ]
+
+        options = dict(
+            title=hue,
+            loc='upper left',
+            bbox_to_anchor=(1.02, 1),
+            frameon=False
+        )
+        options.update(legend_kwargs or {})
+
+        ax.legend(
+            handles=handles,
+            **options
+        )
+
+    fig.patch.set_facecolor('none')
+    ax.set_facecolor('none')
+    ax.grid(False)
+
+    fig.subplots_adjust(
+        left=0.02,
+        right=0.82 if legend else 0.98,
+        bottom=0.08,
+        top=0.98
+    )
+
+    if save is not None:
+        fig.savefig(
+            save,
+            dpi=dpi,
+            bbox_inches='tight'
+        )
+
+    if show:
+        plt.show()
+
+    return fig, ax, plot_df
+
+
+def plot_paired_trend(
+    df,
+    y_group="3_d",
+    x_group="basis",
+    pair_col=None,
+    basis_order=None,
+    time=None,
+    figsize=(7, 6),
+
+    # trim 参数
+    trim_abs=None,
+    trim_ylim=None,
+    trim_quantile=None,
+
+    # log 平移参数
+    use_shift = True,
+    min_shifted=1.0,
+
+    # 颜色与线条参数
+    cmap_name="viridis",
+    line_colors=None,
+    point_colors=None,
+    linewidth=0.9,
+    line_alpha=0.80,
+    scatter_size=14,
+    scatter_alpha=0.90,
+    scatter_linewidth=0.5,
+    set_title= True,
+    set_label= True,
+
+    # mean ± SEM 参数
+    show_mean_sem=True,
+    mean_color="black",
+    mean_linewidth=1.0,
+    mean_markersize=5,
+    capsize=4,
+
+    # 右侧文字参数
+    show_right_label=True,
+    label_top_n=None,
+    text_dx=0.10,
+    text_fontsize=8,
+    text_angle=0,
+    text_alpha=0.95,
+    text_color_by_strength=True,
+
+    # 坐标轴参数
+    use_log=True,
+    show_zero_line=True,
+    xlabel="Basis",
+    ylabel=None,
+    title=None,
+    rotation=0,
+
+    # 图例与保存
+    show_colorbar=True,
+    legend=True,
+    save=None,
+    ax=None, fig=None, show=True,
+):
+    """
+    Paired trend plot with optional trimming, integer upward shifting, log y-axis,
+    viridis-colored paired lines, and right-side index labels.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe.
+    y_group : str
+        Column name for raw paired difference, e.g. "3_d".
+    x_group : str
+        Column name for method / basis.
+    pair_col : str or None
+        Column name for paired sample ID. If None, dataframe index is used.
+    basis_order : list or None
+        Order of x-axis categories.
+    trim_abs : float or None
+        Keep rows with abs(y_group) <= trim_abs.
+    trim_ylim : tuple or None
+        Keep rows with trim_ylim[0] <= y_group <= trim_ylim[1].
+    trim_quantile : tuple or None
+        Keep rows within quantile range, e.g. (0.01, 0.99).
+    text_angle : float
+        Rotation angle of right-side text labels.
+    """
+
+    # =========================
+    # 0. Copy data
+    # =========================
+    plot_df = df.copy()
+
+    if pair_col is None:
+        plot_df["pair_id"] = plot_df.index.astype(str)
+    else:
+        plot_df["pair_id"] = plot_df[pair_col].astype(str)
+
+    y_shift_group = f"{y_group}_shift"
+
+    plot_df[y_group] = plot_df[y_group].astype(float)
+
+    # =========================
+    # 1. basis 顺序
+    # =========================
+    if basis_order is None:
+        if hasattr(plot_df[x_group], "cat"):
+            basis_order = plot_df[x_group].cat.categories.tolist()
+        else:
+            basis_order = plot_df[x_group].drop_duplicates().tolist()
+
+    x_map = {b: i for i, b in enumerate(basis_order)}
+
+    # =========================
+    # 2. trim 离散点
+    # =========================
+    raw_n = plot_df.shape[0]
+
+    if trim_ylim is not None:
+        y_low, y_high = trim_ylim
+    elif trim_abs is not None:
+        y_low, y_high = -float(trim_abs), float(trim_abs)
+    elif trim_quantile is not None:
+        q_low, q_high = trim_quantile
+        y_low, y_high = plot_df[y_group].quantile([q_low, q_high]).to_numpy()
+    else:
+        y_low, y_high = -np.inf, np.inf
+
+    plot_df = plot_df[
+        plot_df[y_group].between(y_low, y_high)
+    ].copy()
+
+    trim_n = plot_df.shape[0]
+
+    print(f"Raw rows = {raw_n}")
+    print(f"Rows after trim = {trim_n}")
+    print(f"Trim range = [{y_low:.4f}, {y_high:.4f}]")
+
+    if trim_n == 0:
+        raise ValueError("No data left after trimming. Please loosen trim_abs / trim_ylim / trim_quantile.")
+
+    # =========================
+    # 3. 整体向上平移，使 log 纵坐标可用
+    # =========================
+    y_raw = plot_df[y_group].astype(float)
+    y_min = np.nanmin(y_raw)
+
+    if use_shift:
+        y_shift = max(0, int(np.ceil(min_shifted - y_min)))
+        print(f"Original min after trim = {y_min:.4f}")
+        print(f"Integer shift = {y_shift}")
+    else:
+        y_shift = 0
+    plot_df[y_shift_group] = plot_df[y_group] + y_shift
+
+
+    # =========================
+    # 4. 计算每条趋势线的变化强度
+    # =========================
+    trend_strength = (
+        plot_df
+        .dropna(subset=[x_group, y_group])
+        .groupby("pair_id")[y_group]
+        .agg(lambda x: np.nanmax(x) - np.nanmin(x))
+    )
+
+    vmin = trend_strength.min()
+    vmax = trend_strength.max()
+
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-12
+
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap(cmap_name)
+
+    # =========================
+    # 5. 绘图
+    # =========================
+    sns.set_theme(style="ticks")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+
+    # =========================
+    # 5.1 个体配对趋势线
+    # =========================
+    for pid, sub in plot_df.groupby("pair_id"):
+        sub = sub.dropna(subset=[x_group, y_shift_group]).copy()
+        sub = sub[sub[x_group].isin(basis_order)]
+        sub["x_pos"] = sub[x_group].map(x_map)
+        sub = sub.sort_values("x_pos")
+
+        if sub.shape[0] >= 2:
+            strength = trend_strength.loc[pid]
+            color = cmap(norm(strength))
+            if line_colors is None:
+                lcolor = color
+            else:
+                lcolor =sub[line_colors].values[-1]
+
+            if point_colors is None:
+                pcolor = color
+            else:
+                pcolor = sub[point_colors].values
+        
+            ax.plot(
+                sub["x_pos"],
+                sub[y_shift_group],
+                color=lcolor,
+                linewidth=linewidth,
+                alpha=line_alpha,
+                zorder=1
+            )
+
+            ax.scatter(
+                sub["x_pos"],
+                sub[y_shift_group],
+                color='none',
+                s=scatter_size,
+                edgecolors=pcolor ,
+                linewidth=scatter_linewidth,
+                alpha=scatter_alpha,
+                zorder=2
+            )
+
+    # =========================
+    # 5.2 均值 ± SEM
+    # =========================
+    if show_mean_sem:
+        summary = (
+            plot_df
+            .groupby(x_group, observed=False)[y_shift_group]
+            .agg(["mean", "sem"])
+            .reindex(basis_order)
+        )
+
+        x = np.arange(len(basis_order))
+
+        mean_y = summary["mean"].to_numpy()
+        sem_y = summary["sem"].fillna(0).to_numpy()
+
+        if use_log:
+
+            # log scale 下不能 <=0
+            lower_y = np.maximum(
+                mean_y - sem_y,
+                1e-8
+            )
+
+            upper_y = mean_y + sem_y
+
+            yerr = np.vstack([
+                mean_y - lower_y,
+                upper_y - mean_y
+            ])
+
+        else:
+            yerr = sem_y
+    
+
+        ax.errorbar(
+            x,
+            mean_y,
+            yerr=yerr,
+            marker="o",
+            markersize=mean_markersize,
+            linewidth=mean_linewidth,
+            capsize=capsize,
+            color=mean_color,
+            zorder=5,
+            # label="Mean ± SEM"
+        )
+
+    # =========================
+    # 5.3 原始 0 线
+    # =========================
+    if show_zero_line:
+        ax.axhline(
+            y_shift,
+            color="black",
+            linewidth=1,
+            linestyle="--",
+            alpha=1.0,
+            zorder=3,
+            # label="Original 0 line"
+        )
+
+    # =========================
+    # 5.4 右侧 index / pair_id 标签
+    # =========================
+    label_df_all = None
+    if show_right_label:
+        right_basis = basis_order[-1]
+        right_x = x_map[right_basis]
+
+        label_df = plot_df[
+            plot_df[x_group].eq(right_basis)
+        ].dropna(subset=[y_shift_group]).copy()
+
+        label_df = label_df.drop_duplicates(subset=["pair_id"])
+
+        label_df = label_df.sort_values(y_shift_group)
+        label_df_all = label_df.copy()
+        if label_top_n is not None:
+            top_ids = (
+                trend_strength
+                .sort_values(ascending=False)
+                .head(label_top_n)
+                .index
+            )
+            label_df = label_df[label_df["pair_id"].isin(top_ids)]
+
+        # label_df = label_df.sort_values(y_shift_group)
+
+        for _, row in label_df.iterrows():
+            pid = row["pair_id"]
+            y_value = row[y_shift_group]
+
+            if text_color_by_strength and pid in trend_strength.index:
+                text_color = cmap(norm(trend_strength.loc[pid]))
+            else:
+                text_color = "black"
+
+            ax.text(
+                right_x + text_dx,
+                y_value,
+                str(pid),
+                fontsize=text_fontsize,
+                rotation=text_angle,
+                rotation_mode="anchor",
+                va="center",
+                ha="left",
+                color=text_color,
+                alpha=text_alpha,
+                clip_on=False,
+                zorder=10
+            )
+
+        # 给右侧文字留空间
+        ax.set_xlim(-0.5, len(basis_order) - 0.5 + 1.0)
+    else:
+        ax.set_xlim(-0.5, len(basis_order) - 0.5)
+
+    # =========================
+    # 6. 坐标轴
+    # =========================
+    if use_log:
+        ax.set_yscale("log")
+
+    x = np.arange(len(basis_order))
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        basis_order,
+        rotation=rotation,
+        fontdict={'size': 8},
+        ha="right")
+
+    ax.set_xlabel(xlabel)
+
+    if ylabel is None:
+        ylabel = f"Shifted score difference: {y_group} + {y_shift}"
+    if set_label:
+        ax.set_ylabel(ylabel)
+
+    if title is None:
+        if time is None:
+            title = f"Paired trend across {x_group}"
+        else:
+            title = f"Paired trend across {x_group} at {time}"
+    if set_title:
+        ax.set_title(title)
+
+    ax.grid(False)
+
+    # 四周边框
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.5)
+
+    # =========================
+    # 7. 颜色条
+    # =========================
+    if show_colorbar:
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+
+        cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+        if set_label:
+            cbar.set_label("Trend strength: max - min")
+
+    if legend:
+        ax.legend(frameon=False)
+    
+    if show:
+        plt.tight_layout()
+        if save is not None:
+            fig.savefig(f"{save}.paired_trend_log.pdf", transparent=True, format="pdf")
+            fig.savefig(f"{save}.paired_trend_log.png", dpi=900, bbox_inches="tight")
+            plot_df.to_csv(f"{save}.paired_trend_log.data.csv", index=True)
+
+        plt.show()
+        return fig, ax, plot_df, trend_strength, label_df_all
+
+
+
+from itertools import combinations
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from scipy import stats
+
+
+def _adjust_pvalues(pvalues, method="holm"):
+    """Adjust finite p-values while preserving their original order."""
+    pvalues = np.asarray(pvalues, dtype=float)
+    adjusted = np.full(pvalues.shape, np.nan, dtype=float)
+    valid = np.isfinite(pvalues)
+    p = pvalues[valid]
+    m = p.size
+
+    if m == 0:
+        return adjusted
+
+    method = "none" if method is None else str(method).lower()
+    if method in {"none", "raw"}:
+        q = p
+    elif method in {"bonferroni", "bonf"}:
+        q = np.minimum(p * m, 1.0)
+    elif method == "holm":
+        order = np.argsort(p)
+        ranked = p[order]
+        ranked = np.maximum.accumulate((m - np.arange(m)) * ranked)
+        q = np.empty(m, dtype=float)
+        q[order] = np.minimum(ranked, 1.0)
+    elif method in {"fdr_bh", "bh"}:
+        order = np.argsort(p)
+        ranked = p[order]
+        ranked = ranked * m / np.arange(1, m + 1)
+        ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+        q = np.empty(m, dtype=float)
+        q[order] = np.minimum(ranked, 1.0)
+    else:
+        raise ValueError(
+            "stat_correction must be 'holm', 'bonferroni', "
+            "'fdr_bh' or None."
+        )
+
+    adjusted[valid] = q
+    return adjusted
+
+
+def _pvalue_text(pvalue, mode="star"):
+    if not np.isfinite(pvalue):
+        return "NA"
+
+    if pvalue < 1e-4:
+        star = "****"
+    elif pvalue < 1e-3:
+        star = "***"
+    elif pvalue < 1e-2:
+        star = "**"
+    elif pvalue < 0.05:
+        star = "*"
+    else:
+        star = "ns"
+
+    ptext = "p<1e-4" if pvalue < 1e-4 else f"p={pvalue:.3g}"
+    if mode == "star":
+        return star
+    if mode == "pvalue":
+        return ptext
+    if mode == "both":
+        return f"{star} ({ptext})"
+    raise ValueError("stat_format must be 'star', 'pvalue' or 'both'.")
+
+
+def _paired_test(x, y, method="wilcoxon", alternative="two-sided"):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    x, y = x[keep], y[keep]
+
+    if x.size < 2:
+        return np.nan, np.nan, int(x.size)
+
+    difference = x - y
+    if np.allclose(difference, 0):
+        return 0.0, 1.0, int(x.size)
+
+    method = str(method).lower()
+    if method in {"ttest", "t-test", "paired_t"}:
+        result = stats.ttest_rel(
+            x,
+            y,
+            alternative=alternative,
+            nan_policy="omit",
+        )
+    elif method in {"wilcoxon", "wilcox"}:
+        result = stats.wilcoxon(
+            x,
+            y,
+            alternative=alternative,
+            zero_method="wilcox",
+            method="auto",
+        )
+    else:
+        raise ValueError("stat_test must be 'ttest' or 'wilcoxon'.")
+
+    return float(result.statistic), float(result.pvalue), int(x.size)
+
+
+def _repeated_measures_anova(values):
+    """Balanced one-way repeated-measures ANOVA for complete pairs."""
+    values = np.asarray(values, dtype=float)
+    n, k = values.shape
+    if n < 2 or k < 2:
+        return np.nan, np.nan
+
+    grand = values.mean()
+    ss_total = np.sum((values - grand) ** 2)
+    ss_group = n * np.sum((values.mean(axis=0) - grand) ** 2)
+    ss_subject = k * np.sum((values.mean(axis=1) - grand) ** 2)
+    ss_error = max(ss_total - ss_group - ss_subject, 0.0)
+
+    df_group = k - 1
+    df_error = (n - 1) * (k - 1)
+    ms_group = ss_group / df_group
+    ms_error = ss_error / df_error
+
+    if ms_error <= np.finfo(float).eps:
+        if ms_group <= np.finfo(float).eps:
+            return 0.0, 1.0
+        return np.inf, 0.0
+
+    statistic = ms_group / ms_error
+    pvalue = stats.f.sf(statistic, df_group, df_error)
+    return float(statistic), float(pvalue)
+
+
+def _resolve_stat_pairs(groups, stat_pairs):
+    if len(groups) < 2:
+        return []
+    if stat_pairs is None or stat_pairs == "all":
+        return list(combinations(groups, 2))
+    if stat_pairs == "adjacent":
+        return list(zip(groups[:-1], groups[1:]))
+
+    pairs = [tuple(pair) for pair in stat_pairs]
+    for first, second in pairs:
+        if first not in groups or second not in groups or first == second:
+            raise ValueError(f"Invalid stat pair: {(first, second)}")
+    return pairs
+
+
+def _paired_statistics(
+    plot_df,
+    y_group,
+    x_group,
+    basis_order,
+    stat_test,
+    stat_pairs,
+    stat_correction,
+    stat_alternative,
+    stat_global,
+):
+    values = plot_df[["pair_id", x_group, y_group]].dropna().copy()
+    duplicated = values.duplicated(["pair_id", x_group], keep=False)
+    if duplicated.any():
+        raise ValueError(
+            "Each pair_id must have at most one value in each group "
+            "for paired statistical testing."
+        )
+
+    wide = values.pivot(index="pair_id", columns=x_group, values=y_group)
+    groups = [group for group in basis_order if group in wide.columns]
+    rows = []
+
+    method = str(stat_test).lower()
+    if stat_global and len(groups) > 2:
+        complete = wide[groups].dropna()
+        matrix = complete.to_numpy(dtype=float)
+
+        if matrix.shape[0] >= 2:
+            if method in {"wilcoxon", "wilcox"}:
+                if np.allclose(matrix - matrix[:, [0]], 0):
+                    statistic, pvalue = 0.0, 1.0
+                else:
+                    result = stats.friedmanchisquare(*matrix.T)
+                    statistic = float(result.statistic)
+                    pvalue = float(result.pvalue)
+                test_name = "Friedman"
+            elif method in {"ttest", "t-test", "paired_t"}:
+                statistic, pvalue = _repeated_measures_anova(matrix)
+                test_name = "RM-ANOVA"
+            else:
+                raise ValueError("stat_test must be 'ttest' or 'wilcoxon'.")
+
+            rows.append({
+                "kind": "global",
+                "group1": None,
+                "group2": None,
+                "test": test_name,
+                "statistic": statistic,
+                "pvalue": pvalue,
+                "pvalue_adj": pvalue,
+                "n": int(matrix.shape[0]),
+            })
+
+    pair_rows = []
+    for first, second in _resolve_stat_pairs(groups, stat_pairs):
+        paired = wide[[first, second]].dropna()
+        statistic, pvalue, n = _paired_test(
+            paired[first],
+            paired[second],
+            method=stat_test,
+            alternative=stat_alternative,
+        )
+        pair_rows.append({
+            "kind": "pairwise",
+            "group1": first,
+            "group2": second,
+            "test": "paired t-test" if method in {
+                "ttest", "t-test", "paired_t"
+            } else "Wilcoxon",
+            "statistic": statistic,
+            "pvalue": pvalue,
+            "n": n,
+        })
+
+    if pair_rows:
+        adjusted = _adjust_pvalues(
+            [row["pvalue"] for row in pair_rows],
+            method=stat_correction,
+        )
+        for row, pvalue_adj in zip(pair_rows, adjusted):
+            row["pvalue_adj"] = pvalue_adj
+        rows.extend(pair_rows)
+
+    return pd.DataFrame(rows, columns=[
+        "kind", "group1", "group2", "test", "statistic",
+        "pvalue", "pvalue_adj", "n",
+    ])
+
+
+def _annotate_statistics(
+    ax,
+    stat_df,
+    x_map,
+    use_log,
+    stat_format,
+    stat_show_ns,
+    stat_show_n,
+    stat_color,
+    stat_fontsize,
+    stat_linewidth,
+):
+    if stat_df.empty:
+        return
+
+    pair_rows = stat_df[stat_df["kind"] == "pairwise"].copy()
+    pair_rows = pair_rows[np.isfinite(pair_rows["pvalue_adj"])]
+    if not stat_show_ns:
+        pair_rows = pair_rows[pair_rows["pvalue_adj"] < 0.05]
+
+    if not pair_rows.empty:
+        pair_rows["distance"] = pair_rows.apply(
+            lambda row: abs(x_map[row["group2"]] - x_map[row["group1"]]),
+            axis=1,
+        )
+        pair_rows = pair_rows.sort_values("distance")
+
+    global_rows = stat_df[stat_df["kind"] == "global"]
+    lower, upper = ax.get_ylim()
+
+    if use_log:
+        if lower <= 0 or upper <= 0:
+            raise ValueError("Log-scale significance annotation requires positive limits.")
+        low_t, high_t = np.log10(lower), np.log10(upper)
+        span = max(high_t - low_t, 0.5)
+        start = high_t + 0.06 * span
+        step = 0.13 * span
+        height = 0.035 * span
+        transform = lambda value: 10 ** value
+    else:
+        span = max(upper - lower, abs(upper) * 0.1, 1e-12)
+        start = upper + 0.06 * span
+        step = 0.13 * span
+        height = 0.035 * span
+        transform = lambda value: value
+
+    level = 0
+    for _, row in pair_rows.iterrows():
+        first = x_map[row["group1"]]
+        second = x_map[row["group2"]]
+        if first > second:
+            first, second = second, first
+
+        y0 = transform(start + level * step)
+        y1 = transform(start + level * step + height)
+        label = _pvalue_text(row["pvalue_adj"], stat_format)
+        if stat_show_n:
+            label = f"{label}\n(n={int(row['n'])})"
+
+        ax.plot(
+            [first, first, second, second],
+            [y0, y1, y1, y0],
+            color=stat_color,
+            linewidth=stat_linewidth,
+            clip_on=False,
+            zorder=20,
+        )
+        ax.text(
+            (first + second) / 2,
+            y1,
+            label,
+            color=stat_color,
+            fontsize=stat_fontsize,
+            ha="center",
+            va="bottom",
+            clip_on=False,
+            zorder=21,
+        )
+        level += 1
+
+    if not global_rows.empty:
+        row = global_rows.iloc[0]
+        y = transform(start + level * step + height)
+        label = f"{row['test']}: {_pvalue_text(row['pvalue'], 'pvalue')}"
+        if stat_show_n:
+            label += f" (n={int(row['n'])})"
+        ax.text(
+            np.mean(list(x_map.values())),
+            y,
+            label,
+            color=stat_color,
+            fontsize=stat_fontsize,
+            ha="center",
+            va="bottom",
+            clip_on=False,
+            zorder=21,
+        )
+        level += 1
+
+    if level:
+        new_upper = transform(start + level * step + 0.08 * span)
+        ax.set_ylim(lower, new_upper)
+
+
+def plot_paired_trend_log(
+    df,
+    y_group="3_d",
+    x_group="basis",
+    pair_col=None,
+    basis_order=None,
+    time=None,
+    figsize=(7, 6),
+
+    # trim 参数
+    trim_abs=None,
+    trim_ylim=None,
+    trim_quantile=None,
+
+    # log 平移参数
+    use_shift = True,
+    min_shifted=1.0,
+
+    # 颜色与线条参数
+    cmap_name="viridis",
+    linewidth=0.9,
+    line_alpha=0.80,
+    scatter_size=14,
+    scatter_alpha=0.90,
+    set_title= True,
+    set_label= True,
+
+    # mean ± SEM 参数
+    show_mean_sem=True,
+    mean_color="black",
+    mean_linewidth=1.0,
+    mean_markersize=5,
+    capsize=4,
+
+    # 右侧文字参数
+    show_right_label=True,
+    label_top_n=None,
+    text_dx=0.10,
+    text_fontsize=8,
+    text_angle=0,
+    text_alpha=0.95,
+    text_color_by_strength=True,
+
+    # 坐标轴参数
+    use_log=True,
+    show_zero_line=True,
+    xlabel="Basis",
+    ylabel=None,
+    title=None,
+    rotation=0,
+
+    # 配对统计参数
+    show_stat=True,
+    stat_test="wilcoxon",
+    stat_pairs=None,
+    stat_correction="holm",
+    stat_alternative="two-sided",
+    stat_global=True,
+    stat_format="star",
+    stat_show_ns=True,
+    stat_show_n=False,
+    stat_color="black",
+    stat_fontsize=8,
+    stat_linewidth=0.8,
+
+    # 图例与保存
+    show_colorbar=True,
+    legend=True,
+    save=None,
+    ax=None, fig=None, show=True,
+    return_stats=False,
+):
+    """
+    Paired trend plot with optional trimming, integer upward shifting, log y-axis,
+    viridis-colored paired lines, and right-side index labels.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe.
+    y_group : str
+        Column name for raw paired difference, e.g. "3_d".
+    x_group : str
+        Column name for method / basis.
+    pair_col : str or None
+        Column name for paired sample ID. If None, dataframe index is used.
+    basis_order : list or None
+        Order of x-axis categories.
+    trim_abs : float or None
+        Keep rows with abs(y_group) <= trim_abs.
+    trim_ylim : tuple or None
+        Keep rows with trim_ylim[0] <= y_group <= trim_ylim[1].
+    trim_quantile : tuple or None
+        Keep rows within quantile range, e.g. (0.01, 0.99).
+    text_angle : float
+        Rotation angle of right-side text labels.
+    show_stat : bool
+        Whether to calculate and display paired statistical significance.
+    stat_test : {'wilcoxon', 'ttest'}
+        Pairwise test. With more than two groups, it also selects Friedman
+        (wilcoxon) or repeated-measures ANOVA (ttest) as the global test.
+    stat_pairs : None, 'all', 'adjacent' or sequence of tuple
+        Group pairs to compare. None compares all pairs.
+    stat_correction : {'holm', 'bonferroni', 'fdr_bh', None}
+        Multiple-testing correction applied to pairwise p-values.
+    stat_alternative : {'two-sided', 'less', 'greater'}
+        Alternative hypothesis. Its direction follows (group1 - group2).
+    return_stats : bool
+        If True, append the statistics DataFrame to the returned tuple.
+    """
+
+    # =========================
+    # 0. Copy data
+    # =========================
+    plot_df = df.copy()
+
+    if pair_col is None:
+        plot_df["pair_id"] = plot_df.index.astype(str)
+    else:
+        plot_df["pair_id"] = plot_df[pair_col].astype(str)
+
+    y_shift_group = f"{y_group}_shift"
+
+    plot_df[y_group] = plot_df[y_group].astype(float)
+
+    # =========================
+    # 1. basis 顺序
+    # =========================
+    if basis_order is None:
+        if hasattr(plot_df[x_group], "cat"):
+            basis_order = plot_df[x_group].cat.categories.tolist()
+        else:
+            basis_order = plot_df[x_group].drop_duplicates().tolist()
+
+    x_map = {b: i for i, b in enumerate(basis_order)}
+
+    # =========================
+    # 2. trim 离散点
+    # =========================
+    raw_n = plot_df.shape[0]
+
+    if trim_ylim is not None:
+        y_low, y_high = trim_ylim
+    elif trim_abs is not None:
+        y_low, y_high = -float(trim_abs), float(trim_abs)
+    elif trim_quantile is not None:
+        q_low, q_high = trim_quantile
+        y_low, y_high = plot_df[y_group].quantile([q_low, q_high]).to_numpy()
+    else:
+        y_low, y_high = -np.inf, np.inf
+
+    plot_df = plot_df[
+        plot_df[y_group].between(y_low, y_high)
+    ].copy()
+
+    trim_n = plot_df.shape[0]
+
+    print(f"Raw rows = {raw_n}")
+    print(f"Rows after trim = {trim_n}")
+    print(f"Trim range = [{y_low:.4f}, {y_high:.4f}]")
+
+    if trim_n == 0:
+        raise ValueError("No data left after trimming. Please loosen trim_abs / trim_ylim / trim_quantile.")
+
+    # =========================
+    # 3. 整体向上平移，使 log 纵坐标可用
+    # =========================
+    y_raw = plot_df[y_group].astype(float)
+    y_min = np.nanmin(y_raw)
+
+    if use_shift:
+        y_shift = max(0, int(np.ceil(min_shifted - y_min)))
+        print(f"Original min after trim = {y_min:.4f}")
+        print(f"Integer shift = {y_shift}")
+    else:
+        y_shift = 0
+    plot_df[y_shift_group] = plot_df[y_group] + y_shift
+
+    if use_log and np.any(plot_df[y_shift_group] <= 0):
+        raise ValueError(
+            "Log scale requires positive plotted values. Enable use_shift "
+            "or use use_log=False."
+        )
+
+    if show_stat:
+        stat_df = _paired_statistics(
+            plot_df=plot_df,
+            y_group=y_group,
+            x_group=x_group,
+            basis_order=basis_order,
+            stat_test=stat_test,
+            stat_pairs=stat_pairs,
+            stat_correction=stat_correction,
+            stat_alternative=stat_alternative,
+            stat_global=stat_global,
+        )
+    else:
+        stat_df = pd.DataFrame(columns=[
+            "kind", "group1", "group2", "test", "statistic",
+            "pvalue", "pvalue_adj", "n",
+        ])
+
+
+    # =========================
+    # 4. 计算每条趋势线的变化强度
+    # =========================
+    trend_strength = (
+        plot_df
+        .dropna(subset=[x_group, y_group])
+        .groupby("pair_id")[y_group]
+        .agg(lambda x: np.nanmax(x) - np.nanmin(x))
+    )
+
+    vmin = trend_strength.min()
+    vmax = trend_strength.max()
+
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-12
+
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap(cmap_name)
+
+    # =========================
+    # 5. 绘图
+    # =========================
+    sns.set_theme(style="ticks")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    elif fig is None:
+        fig = ax.figure
+
+    # =========================
+    # 5.1 个体配对趋势线
+    # =========================
+    for pid, sub in plot_df.groupby("pair_id"):
+        sub = sub.dropna(subset=[x_group, y_shift_group]).copy()
+        sub = sub[sub[x_group].isin(basis_order)]
+        sub["x_pos"] = sub[x_group].map(x_map)
+        sub = sub.sort_values("x_pos")
+
+        if sub.shape[0] >= 2:
+            strength = trend_strength.loc[pid]
+            color = cmap(norm(strength))
+
+            ax.plot(
+                sub["x_pos"],
+                sub[y_shift_group],
+                color=color,
+                linewidth=linewidth,
+                alpha=line_alpha,
+                zorder=1
+            )
+
+            ax.scatter(
+                sub["x_pos"],
+                sub[y_shift_group],
+                color=color,
+                s=scatter_size,
+                edgecolors='none',
+                alpha=scatter_alpha,
+                zorder=2
+            )
+
+    # =========================
+    # 5.2 均值 ± SEM
+    # =========================
+    if show_mean_sem:
+        summary = (
+            plot_df
+            .groupby(x_group, observed=False)[y_shift_group]
+            .agg(["mean", "sem"])
+            .reindex(basis_order)
+        )
+
+        x = np.arange(len(basis_order))
+
+        mean_y = summary["mean"].to_numpy()
+        sem_y = summary["sem"].fillna(0).to_numpy()
+
+        if use_log:
+
+            # log scale 下不能 <=0
+            lower_y = np.maximum(
+                mean_y - sem_y,
+                1e-8
+            )
+
+            upper_y = mean_y + sem_y
+
+            yerr = np.vstack([
+                mean_y - lower_y,
+                upper_y - mean_y
+            ])
+
+        else:
+            yerr = sem_y
+    
+
+        ax.errorbar(
+            x,
+            mean_y,
+            yerr=yerr,
+            marker="o",
+            markersize=mean_markersize,
+            linewidth=mean_linewidth,
+            capsize=capsize,
+            color=mean_color,
+            zorder=5,
+            # label="Mean ± SEM"
+        )
+
+    # =========================
+    # 5.3 原始 0 线
+    # =========================
+    if show_zero_line:
+        ax.axhline(
+            y_shift,
+            color="black",
+            linewidth=1,
+            linestyle="--",
+            alpha=1.0,
+            zorder=3,
+            # label="Original 0 line"
+        )
+
+    # =========================
+    # 5.4 右侧 index / pair_id 标签
+    # =========================
+    label_df_all = None
+    if show_right_label:
+        right_basis = basis_order[-1]
+        right_x = x_map[right_basis]
+
+        label_df = plot_df[
+            plot_df[x_group].eq(right_basis)
+        ].dropna(subset=[y_shift_group]).copy()
+
+        label_df = label_df.drop_duplicates(subset=["pair_id"])
+
+        label_df = label_df.sort_values(y_shift_group)
+        label_df_all = label_df.copy()
+        if label_top_n is not None:
+            top_ids = (
+                trend_strength
+                .sort_values(ascending=False)
+                .head(label_top_n)
+                .index
+            )
+            label_df = label_df[label_df["pair_id"].isin(top_ids)]
+
+        # label_df = label_df.sort_values(y_shift_group)
+
+        for _, row in label_df.iterrows():
+            pid = row["pair_id"]
+            y_value = row[y_shift_group]
+
+            if text_color_by_strength and pid in trend_strength.index:
+                text_color = cmap(norm(trend_strength.loc[pid]))
+            else:
+                text_color = "black"
+
+            ax.text(
+                right_x + text_dx,
+                y_value,
+                str(pid),
+                fontsize=text_fontsize,
+                rotation=text_angle,
+                rotation_mode="anchor",
+                va="center",
+                ha="left",
+                color=text_color,
+                alpha=text_alpha,
+                clip_on=False,
+                zorder=10
+            )
+
+        # 给右侧文字留空间
+        ax.set_xlim(-0.5, len(basis_order) - 0.5 + 1.0)
+    else:
+        ax.set_xlim(-0.5, len(basis_order) - 0.5)
+
+    # =========================
+    # 6. 坐标轴
+    # =========================
+    if use_log:
+        ax.set_yscale("log")
+
+    x = np.arange(len(basis_order))
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        basis_order,
+        rotation=rotation,
+        fontdict={'size': 8},
+        ha="right")
+
+    ax.set_xlabel(xlabel)
+
+    if show_stat:
+        _annotate_statistics(
+            ax=ax,
+            stat_df=stat_df,
+            x_map=x_map,
+            use_log=use_log,
+            stat_format=stat_format,
+            stat_show_ns=stat_show_ns,
+            stat_show_n=stat_show_n,
+            stat_color=stat_color,
+            stat_fontsize=stat_fontsize,
+            stat_linewidth=stat_linewidth,
+        )
+
+    if ylabel is None:
+        ylabel = f"Shifted score difference: {y_group} + {y_shift}"
+    if set_label:
+        ax.set_ylabel(ylabel)
+
+    if title is None:
+        if time is None:
+            title = f"Paired trend across {x_group}"
+        else:
+            title = f"Paired trend across {x_group} at {time}"
+    if set_title:
+        ax.set_title(title)
+
+    ax.grid(False)
+
+    # 四周边框
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.5)
+
+    # =========================
+    # 7. 颜色条
+    # =========================
+    if show_colorbar:
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+
+        cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+        if set_label:
+            cbar.set_label("Trend strength: max - min")
+
+    if legend:
+        ax.legend(frameon=False)
+
+    plot_df.attrs["statistics"] = stat_df
+    fig.tight_layout()
+
+    if save is not None:
+        fig.savefig(
+            f"{save}.paired_trend_log.pdf",
+            transparent=True,
+            format="pdf",
+            bbox_inches="tight",
+        )
+        fig.savefig(
+            f"{save}.paired_trend_log.png",
+            dpi=900,
+            bbox_inches="tight",
+        )
+        plot_df.to_csv(f"{save}.paired_trend_log.data.csv", index=True)
+        stat_df.to_csv(
+            f"{save}.paired_trend_log.statistics.csv",
+            index=False,
+        )
+
+    if show:
+        plt.show()
+
+    result = (fig, ax, plot_df, trend_strength, label_df_all)
+    return (*result, stat_df) if return_stats else result
+
+
+
+
+def plot_paired_trend_log(
+    df,
+    y_group="3_d",
+    x_group="basis",
+    pair_col=None,
+    basis_order=None,
+    time=None,
+    figsize=(7, 6),
+
+    # trim 参数
+    trim_abs=None,
+    trim_ylim=None,
+    trim_quantile=None,
+
+    # log 平移参数
+    use_shift = True,
+    min_shifted=1.0,
+
+    # 颜色与线条参数
+    cmap_name="viridis",
+    linewidth=0.9,
+    line_alpha=0.80,
+    scatter_size=14,
+    scatter_alpha=0.90,
+    set_title= True,
+    set_label= True,
+
+    # mean ± SEM 参数
+    show_mean_sem=True,
+    mean_color="black",
+    mean_linewidth=1.0,
+    mean_markersize=5,
+    capsize=4,
+
+    # 右侧文字参数
+    show_right_label=True,
+    label_top_n=None,
+    text_dx=0.10,
+    text_fontsize=8,
+    text_angle=0,
+    text_alpha=0.95,
+    text_color_by_strength=True,
+
+    # 坐标轴参数
+    use_log=True,
+    show_zero_line=True,
+    xlabel="Basis",
+    ylabel=None,
+    title=None,
+    rotation=0,
+
+    # 图例与保存
+    show_colorbar=True,
+    legend=True,
+    save=None,
+    ax=None, fig=None, show=True,
+):
+    """
+    Paired trend plot with optional trimming, integer upward shifting, log y-axis,
+    viridis-colored paired lines, and right-side index labels.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input dataframe.
+    y_group : str
+        Column name for raw paired difference, e.g. "3_d".
+    x_group : str
+        Column name for method / basis.
+    pair_col : str or None
+        Column name for paired sample ID. If None, dataframe index is used.
+    basis_order : list or None
+        Order of x-axis categories.
+    trim_abs : float or None
+        Keep rows with abs(y_group) <= trim_abs.
+    trim_ylim : tuple or None
+        Keep rows with trim_ylim[0] <= y_group <= trim_ylim[1].
+    trim_quantile : tuple or None
+        Keep rows within quantile range, e.g. (0.01, 0.99).
+    text_angle : float
+        Rotation angle of right-side text labels.
+    """
+
+    # =========================
+    # 0. Copy data
+    # =========================
+    plot_df = df.copy()
+
+    if pair_col is None:
+        plot_df["pair_id"] = plot_df.index.astype(str)
+    else:
+        plot_df["pair_id"] = plot_df[pair_col].astype(str)
+
+    y_shift_group = f"{y_group}_shift"
+
+    plot_df[y_group] = plot_df[y_group].astype(float)
+
+    # =========================
+    # 1. basis 顺序
+    # =========================
+    if basis_order is None:
+        if hasattr(plot_df[x_group], "cat"):
+            basis_order = plot_df[x_group].cat.categories.tolist()
+        else:
+            basis_order = plot_df[x_group].drop_duplicates().tolist()
+
+    x_map = {b: i for i, b in enumerate(basis_order)}
+
+    # =========================
+    # 2. trim 离散点
+    # =========================
+    raw_n = plot_df.shape[0]
+
+    if trim_ylim is not None:
+        y_low, y_high = trim_ylim
+    elif trim_abs is not None:
+        y_low, y_high = -float(trim_abs), float(trim_abs)
+    elif trim_quantile is not None:
+        q_low, q_high = trim_quantile
+        y_low, y_high = plot_df[y_group].quantile([q_low, q_high]).to_numpy()
+    else:
+        y_low, y_high = -np.inf, np.inf
+
+    plot_df = plot_df[
+        plot_df[y_group].between(y_low, y_high)
+    ].copy()
+
+    trim_n = plot_df.shape[0]
+
+    print(f"Raw rows = {raw_n}")
+    print(f"Rows after trim = {trim_n}")
+    print(f"Trim range = [{y_low:.4f}, {y_high:.4f}]")
+
+    if trim_n == 0:
+        raise ValueError("No data left after trimming. Please loosen trim_abs / trim_ylim / trim_quantile.")
+
+    # =========================
+    # 3. 整体向上平移，使 log 纵坐标可用
+    # =========================
+    y_raw = plot_df[y_group].astype(float)
+    y_min = np.nanmin(y_raw)
+
+    if use_shift:
+        y_shift = max(0, int(np.ceil(min_shifted - y_min)))
+        print(f"Original min after trim = {y_min:.4f}")
+        print(f"Integer shift = {y_shift}")
+    else:
+        y_shift = 0
+    plot_df[y_shift_group] = plot_df[y_group] + y_shift
+
+
+    # =========================
+    # 4. 计算每条趋势线的变化强度
+    # =========================
+    trend_strength = (
+        plot_df
+        .dropna(subset=[x_group, y_group])
+        .groupby("pair_id")[y_group]
+        .agg(lambda x: np.nanmax(x) - np.nanmin(x))
+    )
+
+    vmin = trend_strength.min()
+    vmax = trend_strength.max()
+
+    if np.isclose(vmin, vmax):
+        vmax = vmin + 1e-12
+
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.get_cmap(cmap_name)
+
+    # =========================
+    # 5. 绘图
+    # =========================
+    sns.set_theme(style="ticks")
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+
+    # =========================
+    # 5.1 个体配对趋势线
+    # =========================
+    for pid, sub in plot_df.groupby("pair_id"):
+        sub = sub.dropna(subset=[x_group, y_shift_group]).copy()
+        sub = sub[sub[x_group].isin(basis_order)]
+        sub["x_pos"] = sub[x_group].map(x_map)
+        sub = sub.sort_values("x_pos")
+
+        if sub.shape[0] >= 2:
+            strength = trend_strength.loc[pid]
+            color = cmap(norm(strength))
+
+            ax.plot(
+                sub["x_pos"],
+                sub[y_shift_group],
+                color=color,
+                linewidth=linewidth,
+                alpha=line_alpha,
+                zorder=1
+            )
+
+            ax.scatter(
+                sub["x_pos"],
+                sub[y_shift_group],
+                color=color,
+                s=scatter_size,
+                edgecolors='none',
+                alpha=scatter_alpha,
+                zorder=2
+            )
+
+    # =========================
+    # 5.2 均值 ± SEM
+    # =========================
+    if show_mean_sem:
+        summary = (
+            plot_df
+            .groupby(x_group, observed=False)[y_shift_group]
+            .agg(["mean", "sem"])
+            .reindex(basis_order)
+        )
+
+        x = np.arange(len(basis_order))
+
+        mean_y = summary["mean"].to_numpy()
+        sem_y = summary["sem"].fillna(0).to_numpy()
+
+        if use_log:
+
+            # log scale 下不能 <=0
+            lower_y = np.maximum(
+                mean_y - sem_y,
+                1e-8
+            )
+
+            upper_y = mean_y + sem_y
+
+            yerr = np.vstack([
+                mean_y - lower_y,
+                upper_y - mean_y
+            ])
+
+        else:
+            yerr = sem_y
+    
+
+        ax.errorbar(
+            x,
+            mean_y,
+            yerr=yerr,
+            marker="o",
+            markersize=mean_markersize,
+            linewidth=mean_linewidth,
+            capsize=capsize,
+            color=mean_color,
+            zorder=5,
+            # label="Mean ± SEM"
+        )
+
+    # =========================
+    # 5.3 原始 0 线
+    # =========================
+    if show_zero_line:
+        ax.axhline(
+            y_shift,
+            color="black",
+            linewidth=1,
+            linestyle="--",
+            alpha=1.0,
+            zorder=3,
+            # label="Original 0 line"
+        )
+
+    # =========================
+    # 5.4 右侧 index / pair_id 标签
+    # =========================
+    label_df_all = None
+    if show_right_label:
+        right_basis = basis_order[-1]
+        right_x = x_map[right_basis]
+
+        label_df = plot_df[
+            plot_df[x_group].eq(right_basis)
+        ].dropna(subset=[y_shift_group]).copy()
+
+        label_df = label_df.drop_duplicates(subset=["pair_id"])
+
+        label_df = label_df.sort_values(y_shift_group)
+        label_df_all = label_df.copy()
+        if label_top_n is not None:
+            top_ids = (
+                trend_strength
+                .sort_values(ascending=False)
+                .head(label_top_n)
+                .index
+            )
+            label_df = label_df[label_df["pair_id"].isin(top_ids)]
+
+        # label_df = label_df.sort_values(y_shift_group)
+
+        for _, row in label_df.iterrows():
+            pid = row["pair_id"]
+            y_value = row[y_shift_group]
+
+            if text_color_by_strength and pid in trend_strength.index:
+                text_color = cmap(norm(trend_strength.loc[pid]))
+            else:
+                text_color = "black"
+
+            ax.text(
+                right_x + text_dx,
+                y_value,
+                str(pid),
+                fontsize=text_fontsize,
+                rotation=text_angle,
+                rotation_mode="anchor",
+                va="center",
+                ha="left",
+                color=text_color,
+                alpha=text_alpha,
+                clip_on=False,
+                zorder=10
+            )
+
+        # 给右侧文字留空间
+        ax.set_xlim(-0.5, len(basis_order) - 0.5 + 1.0)
+    else:
+        ax.set_xlim(-0.5, len(basis_order) - 0.5)
+
+    # =========================
+    # 6. 坐标轴
+    # =========================
+    if use_log:
+        ax.set_yscale("log")
+
+    x = np.arange(len(basis_order))
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        basis_order,
+        rotation=rotation,
+        fontdict={'size': 8},
+        ha="right")
+
+    ax.set_xlabel(xlabel)
+
+    if ylabel is None:
+        ylabel = f"Shifted score difference: {y_group} + {y_shift}"
+    if set_label:
+        ax.set_ylabel(ylabel)
+
+    if title is None:
+        if time is None:
+            title = f"Paired trend across {x_group}"
+        else:
+            title = f"Paired trend across {x_group} at {time}"
+    if set_title:
+        ax.set_title(title)
+
+    ax.grid(False)
+
+    # 四周边框
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(0.5)
+
+    # =========================
+    # 7. 颜色条
+    # =========================
+    if show_colorbar:
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap)
+        sm.set_array([])
+
+        cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+        if set_label:
+            cbar.set_label("Trend strength: max - min")
+
+    if legend:
+        ax.legend(frameon=False)
+    
+    if show:
+        plt.tight_layout()
+        if save is not None:
+            fig.savefig(f"{save}.paired_trend_log.pdf", transparent=True, format="pdf")
+            fig.savefig(f"{save}.paired_trend_log.png", dpi=900, bbox_inches="tight")
+            plot_df.to_csv(f"{save}.paired_trend_log.data.csv", index=True)
+
+        plt.show()
+        return fig, ax, plot_df, trend_strength, label_df_all
+
+
+# fig, ax, plot_df_trimmed, trend_strength = plot_paired_trend_log(
+#     iidf,
+#     y_group="3_d",
+#     x_group="basis",
+#     time=time,
+    # trim_abs=20,          # 保留 -20 到 20
+    # trim_ylim=(-10, 30),
+#     trim_quantile=(0.02, 0.98),
+    # trim_ylim=(-10, 30),
+    # trim_quantile=(0.01, 0.99),
+#     label_top_n=15,
+#     text_angle=25,
+#     linewidth=0.8,
+#     line_alpha=0.75,
+#     scatter_size=16,
+#     figsize=(7.5, 6),
+# )
+
+
+def slice_knn(Xs, knn=8, ks=1, radius=None,kd_method='annoy', device=None, CI=0.99, disable=True):
     offsets = np.cumsum([0] + [len(X) for X in Xs])
     N_total = int(offsets[-1])
 
@@ -23,8 +2035,8 @@ def slice_knn(Xs, knn=8, ks=1, radius=None,kd_method='annoy',CI=0.99, disable=Tr
             Xa, Xb = Xs[s], Xs[j]
             Na, Nb = len(Xa), len(Xb)
 
-            src1, dst1, dist1 = coord_edges(Xa, Xb, knn = knn, radius=radius, method=kd_method)
-            src2, dst2, dist2 = coord_edges(Xb, Xa, knn = knn, radius=radius, method=kd_method)
+            src1, dst1, dist1 = coord_edges(Xa, Xb, knn = knn, radius=radius, device=device, method=kd_method)
+            src2, dst2, dist2 = coord_edges(Xb, Xa, knn = knn, radius=radius, device=device, method=kd_method)
 
             all_src.append(offsets[s] + src1)
             all_src.append(offsets[j] + src2)
@@ -189,11 +2201,11 @@ def laplacian_smoothness_scores(Xs, Fs=None, W=None, knn=8, radius=None,kd_metho
     print(R)
     return R
 
-def gene_smoothness_scores(Xs, G, Fs= None, W=None, knn=8, radius=None,kd_method='annoy',
+def gene_smoothness_scores(Xs, G, Fs= None, W=None, knn=8, ks=1, radius=None,kd_method='annoy',
                                  CI=0.98,
                                 sigx2=1,sigf2=1, lambdax=1):
     if W is None:
-        W = slice_knn(Xs, knn=knn, radius=radius, kd_method=kd_method, CI=CI)
+        W = slice_knn(Xs, knn=knn, ks=ks,radius=radius, kd_method=kd_method, CI=CI)
     src, dst = W.nonzero()
 
     Xa = np.vstack(Xs)
@@ -284,12 +2296,15 @@ def gwplt_hist1(dfs, figsize=(6, 10), y_lim = (0,100), ys_min = None, ys_max = N
 
 
 def gwplt_hist2(dfs, groupyb='Time', y='Group', scores= [3,4,5],
-             figsize=(6, 10),
+             figsize=(6, 10), gorder=None,
              palette= gwCOLORS[:4], 
              sharex=True, sharey=False,
              linewidth=1, save=None, **kargs):
     import seaborn as sns
-    groups = np.unique(dfs[groupyb])
+    if gorder is None:
+        groups = np.unique(dfs[groupyb])
+    else:
+        groups = gorder
     for iscore in scores:
         fig, axs = plt.subplots( len(groups), 1, figsize=figsize,
                                 constrained_layout=False, sharex=sharex, sharey=sharey)
@@ -611,18 +2626,26 @@ def coord_edges(coordx, coordy=None,
                 method='sknn' ,
                 keep_loops= True,
                 return_array = False,
+                device=None,
                 n_jobs = -1):
 
     import sys
     sys.path.append('/gpfs/home/user19/JupyterCode/')
-    from CellCloudX_v126 import cellcloudx as cc
+    from CellCloudX_v130 import cellcloudx as cc
 
     if coordy is None:
         coordy = coordx
     
-    cknn = cc.tl.Neighbors( method=method ,metric='euclidean', n_jobs=n_jobs)
-    cknn.fit(coordx, radius_max= None,max_neighbor=max_neighbor)
-    distances, indices = cknn.transform(coordy, knn=knn, radius = radius)
+    if method=='keops':
+        cknn = cc.ag.neighbors_ensemble.ko_Neighbors( coordx, Y=coordy, K=knn, device=device)
+        indices, distances = cknn.knn(return_distances=True)
+        indices = indices.cpu().numpy()
+        distances = (distances ** 0.5).cpu().numpy()
+
+    else:
+        cknn = cc.ag.neighbors_ensemble.Neighbors( method=method ,metric='euclidean', n_jobs=n_jobs)
+        cknn.fit(coordx, radius_max= None,max_neighbor=max_neighbor)
+        distances, indices = cknn.transform(coordy, knn=knn, radius = radius)
 
     if return_array:
         return distances, indices

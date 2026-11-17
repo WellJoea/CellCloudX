@@ -6,7 +6,50 @@ import scipy.cluster.hierarchy as sch
 import numpy as np
 import pandas as pd
 from ._colors import random_colors, cmaptolist
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from matplotlib.transforms import blended_transform_factory
+from scipy import sparse
+from matplotlib import rc_context
+
 plt.rcdefaults()
+
+def auto_pointsize(
+    p_num=None, ps=None,
+    fig=None,
+    ax=None,
+    target_coverage=0.20,
+    min_size=1e-4,
+    max_size=20.0,
+):
+    if ps is not None:
+        return float(ps)
+    if p_num is None:
+        return 1.0
+
+    n = max(int(p_num), 1)
+    if fig is None and ax is not None:
+        fig = ax.figure
+    if ax is not None and fig is not None:
+        inv = fig.dpi_scale_trans.inverted()
+        bbox_inches = ax.get_window_extent().transformed(inv)
+        area_px = bbox_inches.width * bbox_inches.height * (fig.dpi ** 2)
+        dpi = fig.dpi
+    elif fig is not None:
+        w_inch, h_inch = fig.get_size_inches()
+        area_px = w_inch * h_inch * (fig.dpi ** 2)
+        dpi = fig.dpi
+    else:
+        w_inch, h_inch = mpl.rcParams["figure.figsize"]
+        dpi = mpl.rcParams["figure.dpi"]
+        area_px = w_inch * h_inch * (dpi ** 2)
+
+    area_per_point_px = (target_coverage * area_px / n) ** 0.90
+    s = area_per_point_px * (72.0 / dpi) ** 2
+    return float(np.clip(s, min_size, max_size))
+
 
 def todigitize(X, bins=256):
     low = np.min(X)
@@ -674,3 +717,606 @@ def clust_dot(
         plt.show()
     else:
         return fig, axs
+    
+    
+
+def scdotplot0(
+    adata,
+    marker_genes,
+    groupby,
+    *,
+    layer=None,
+    use_raw=False,
+    categories=None,
+    expression_cutoff=0,
+    standard_scale="var",
+    cmap="Reds",
+    dot_size=(6, 90),
+    box_color="#FFF3CD",
+    box_edge="#444444",
+    box_alpha=0.45,
+    figsize=None,
+    show=True,
+):
+    """Fast standalone dotplot; return ``fig, ax, data``."""
+    if use_raw:
+        if adata.raw is None:
+            raise ValueError("adata.raw is None")
+        var_names = adata.raw.var_names
+    else:
+        var_names = adata.var_names
+
+    genes, gene_groups, positions = [], [], []
+    for label, values in marker_genes.items():
+        values = [values] if isinstance(values, str) else list(values)
+        start = len(genes)
+        genes.extend(values)
+        gene_groups.extend([label] * len(values))
+        positions.append((label, start, len(genes)))
+
+    unique_genes = list(dict.fromkeys(genes))
+    missing = [g for g in unique_genes if g not in var_names]
+    if missing:
+        raise ValueError(f"Genes not found in adata: {missing[:10]}")
+
+    if use_raw:
+        X = adata.raw[:, unique_genes].X
+    elif layer is None:
+        X = adata[:, unique_genes].X
+    else:
+        X = adata[:, unique_genes].layers[layer]
+
+    groups = adata.obs[groupby]
+    if categories is None:
+        categories = (
+            list(groups.cat.categories)
+            if isinstance(groups.dtype, pd.CategoricalDtype)
+            else list(pd.unique(groups.dropna()))
+        )
+    categories = list(categories)
+    codes = pd.Categorical(groups, categories=categories).codes
+    valid = codes >= 0
+    counts = np.bincount(codes[valid], minlength=len(categories))
+    if np.any(counts == 0):
+        raise ValueError("categories contains an empty group")
+
+    G = sparse.csr_matrix(
+        (np.ones(valid.sum()), (codes[valid], np.flatnonzero(valid))),
+        shape=(len(categories), adata.n_obs),
+    )
+    if sparse.issparse(X):
+        X = X.tocsr()
+        mean = (G @ X).toarray() / counts[:, None]
+        fraction = (G @ (X > expression_cutoff)).toarray() / counts[:, None]
+    else:
+        X = np.asarray(X)
+        mean = np.asarray(G @ X) / counts[:, None]
+        fraction = np.asarray(G @ (X > expression_cutoff)) / counts[:, None]
+
+    gene_index = {g: i for i, g in enumerate(unique_genes)}
+    order = [gene_index[g] for g in genes]
+    mean, fraction = mean[:, order], fraction[:, order]
+    color = mean.copy()
+    if standard_scale == "var":
+        vmin, vmax = color.min(0), color.max(0)
+        color = (color - vmin) / np.where(vmax > vmin, vmax - vmin, 1)
+    elif standard_scale == "group":
+        vmin, vmax = color.min(1)[:, None], color.max(1)[:, None]
+        color = (color - vmin) / np.where(vmax > vmin, vmax - vmin, 1)
+    elif standard_scale is not None:
+        raise ValueError("standard_scale must be 'var', 'group', or None")
+
+    n_groups, n_genes = mean.shape
+    figsize = figsize or (max(8, n_genes * 0.24), max(3, n_groups * 0.35))
+    fig, ax = plt.subplots(figsize=figsize)
+
+    row_index = {label: i for i, label in enumerate(categories)}
+    for label, start, end in positions:
+        if label in row_index:
+            ax.add_patch(
+                Rectangle(
+                    (start, row_index[label]),
+                    end - start,
+                    1,
+                    facecolor=box_color,
+                    edgecolor=box_edge,
+                    linewidth=0.8,
+                    alpha=box_alpha,
+                    zorder=0,
+                )
+            )
+
+    y, x = np.indices(mean.shape)
+    sizes = dot_size[0] + np.clip(fraction, 0, 1) ** 1.5 * (
+        dot_size[1] - dot_size[0]
+    )
+    dots = ax.scatter(
+        x.ravel() + 0.5,
+        y.ravel() + 0.5,
+        s=sizes.ravel(),
+        c=color.ravel(),
+        cmap=cmap,
+        edgecolors="#888888",
+        linewidths=0.25,
+        zorder=2,
+    )
+
+    ax.set(
+        xlim=(0, n_genes),
+        ylim=(n_groups, 0),
+        xticks=np.arange(n_genes) + 0.5,
+        yticks=np.arange(n_groups) + 0.5,
+        xticklabels=genes,
+        yticklabels=categories,
+    )
+    ax.tick_params(axis="x", labelrotation=90, labelsize=7)
+    ax.tick_params(axis="y", labelsize=8)
+    ax.grid(False)
+
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+    for label, start, end in positions:
+        ax.plot([start, end], [1.015, 1.015], color=box_edge, lw=0.7,
+                transform=trans, clip_on=False)
+        ax.text((start + end) / 2, 1.025, str(label), rotation=90,
+                ha="center", va="bottom", fontsize=7,
+                transform=trans, clip_on=False)
+
+    fig.colorbar(dots, ax=ax, fraction=0.012, pad=0.01,
+                 label="Mean expression" if standard_scale is None else "Scaled mean expression")
+    handles = [
+        ax.scatter([], [], s=dot_size[0] + p**1.5 * (dot_size[1] - dot_size[0]),
+                   facecolor="white", edgecolor="#777777", label=f"{p:.0%}")
+        for p in (0.25, 0.50, 0.75, 1.00)
+    ]
+    ax.legend(handles=handles, title="Fraction", frameon=False,
+              bbox_to_anchor=(1.12, 0.5), loc="center left", fontsize=7)
+    fig.tight_layout()
+
+    data = pd.DataFrame(
+        {
+            "group": np.repeat(categories, n_genes),
+            "gene": np.tile(genes, n_groups),
+            "marker_group": np.tile(gene_groups, n_groups),
+            "mean_expression": mean.ravel(),
+            "fraction": fraction.ravel(),
+            "plot_color": color.ravel(),
+        }
+    )
+    if show:
+        plt.show()
+    return fig, ax, data
+
+# fig, ax, dotplot_df = dotplot(DEG1.adata, marker_genes1,  groupby=clumethod,
+#                   expression_cutoff = 0.001,
+
+#                    standard_scale='var',
+#                   use_raw=True,
+#                   cmap=cc.pl.cmap1,
+#                               dot_size=(1,250),
+#                    # figsize=figsize
+# )
+
+
+def scdotplot(
+    adata=None,
+    marker_genes=None,
+    groupby=None,
+    *,
+    data=None,
+    layer=None,
+    use_raw=False,
+    categories=None,
+    expression_cutoff=0,
+    standard_scale="var",
+    cmap="Reds",
+    dot_size=(6, 90),
+    box_color="#FFF3CD",
+    box_edge="#444444",
+    box_alpha=0.45,
+    box_lw =1.0,
+    swap_axes=False,
+    gene_width=0.30,
+    gene_fontsize=7,
+    group_fontsize=8,
+    marker_fontsize=7,
+    edgecolors="#888888",
+    edgelw = 0.25,
+    marker='o',
+    legend_fontsize=7,
+    legend_title_fontsize=8,
+    colorbar_fontsize=8,
+    gene_pad=3,
+    bbox_to_anchor = None,
+    pad =None,
+    lheight=0.03,
+    marker_box_bottom=1.01,
+    marker_box_lw=0.7,
+    marker_gap=0.12,
+    legend_width=2.2,
+    legend_wspace=0.55,
+    legend_height=2.4,
+    figsize=None,
+    show=True,
+    save=None,
+    dpi=2000, transparent=True,
+):
+    """Dotplot from AnnData or from this function's returned DataFrame.
+
+    AnnData mode
+    ------------
+    ``dotplot(adata, marker_genes, groupby='cluster')``
+
+    DataFrame mode
+    --------------
+    ``dotplot(data=dotplot_df, swap_axes=True)``
+
+    Returns
+    -------
+    fig, ax, data
+    """
+    if data is not None:
+        if adata is not None:
+            raise ValueError("Pass either adata or data, not both")
+        adata = data
+    if adata is None:
+        raise ValueError("adata or data must be provided")
+
+    if isinstance(adata, pd.DataFrame):
+        df = adata
+        required = {
+            "group",
+            "gene",
+            "marker_group",
+            "mean_expression",
+            "fraction",
+        }
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"DataFrame missing columns: {sorted(missing)}")
+
+        if categories is None:
+            categories = list(pd.unique(df["group"]))
+        else:
+            observed = set(df["group"].dropna())
+            categories = [group for group in categories if group in observed]
+            if not categories:
+                raise ValueError("No categories are present in DataFrame group")
+
+        blocks = []
+        for group in categories:
+            block = df.loc[df["group"] == group]
+            blocks.append(block)
+
+        genes = blocks[0]["gene"].tolist()
+        gene_groups = blocks[0]["marker_group"].tolist()
+        for group, block in zip(categories[1:], blocks[1:]):
+            if (
+                block["gene"].tolist() != genes
+                or block["marker_group"].tolist() != gene_groups
+            ):
+                raise ValueError(
+                    f"Gene order for group {group!r} differs from the first group"
+                )
+
+        mean = np.vstack(
+            [block["mean_expression"].to_numpy(float) for block in blocks]
+        )
+        fraction = np.vstack(
+            [block["fraction"].to_numpy(float) for block in blocks]
+        )
+
+        positions = []
+        start = 0
+        while start < len(genes):
+            label = gene_groups[start]
+            end = start + 1
+            while end < len(genes) and gene_groups[end] == label:
+                end += 1
+            positions.append((label, start, end))
+            start = end
+
+    else:
+        if marker_genes is None or groupby is None:
+            raise ValueError("AnnData input requires marker_genes and groupby")
+
+        if use_raw:
+            if adata.raw is None:
+                raise ValueError("adata.raw is None")
+            var_names = adata.raw.var_names
+        else:
+            var_names = adata.var_names
+
+        genes, gene_groups, positions = [], [], []
+        for label, values in marker_genes.items():
+            values = [values] if isinstance(values, str) else list(values)
+            start = len(genes)
+            genes.extend(values)
+            gene_groups.extend([label] * len(values))
+            positions.append((label, start, len(genes)))
+
+        unique_genes = list(dict.fromkeys(genes))
+        missing = [g for g in unique_genes if g not in var_names]
+        if missing:
+            raise ValueError(f"Genes not found in adata: {missing[:10]}")
+
+        if use_raw:
+            X = adata.raw[:, unique_genes].X
+        elif layer is None:
+            X = adata[:, unique_genes].X
+        else:
+            X = adata[:, unique_genes].layers[layer]
+
+        groups = adata.obs[groupby]
+        if categories is None:
+            categories = (
+                list(groups.cat.categories)
+                if isinstance(groups.dtype, pd.CategoricalDtype)
+                else list(pd.unique(groups.dropna()))
+            )
+        categories = list(categories)
+        codes = pd.Categorical(groups, categories=categories).codes
+        valid = codes >= 0
+        counts = np.bincount(codes[valid], minlength=len(categories))
+        if np.any(counts == 0):
+            raise ValueError("categories contains an empty group")
+
+        G = sparse.csr_matrix(
+            (np.ones(valid.sum()), (codes[valid], np.flatnonzero(valid))),
+            shape=(len(categories), adata.n_obs),
+        )
+        if sparse.issparse(X):
+            X = X.tocsr()
+            mean = (G @ X).toarray() / counts[:, None]
+            fraction = (
+                (G @ (X > expression_cutoff)).toarray() / counts[:, None]
+            )
+        else:
+            X = np.asarray(X)
+            mean = np.asarray(G @ X) / counts[:, None]
+            fraction = np.asarray(G @ (X > expression_cutoff)) / counts[:, None]
+
+        gene_index = {gene: i for i, gene in enumerate(unique_genes)}
+        order = [gene_index[gene] for gene in genes]
+        mean, fraction = mean[:, order], fraction[:, order]
+
+    color = mean.copy()
+    if standard_scale == "var":
+        vmin, vmax = color.min(0), color.max(0)
+        color = (color - vmin) / np.where(vmax > vmin, vmax - vmin, 1)
+    elif standard_scale == "group":
+        vmin, vmax = color.min(1)[:, None], color.max(1)[:, None]
+        color = (color - vmin) / np.where(vmax > vmin, vmax - vmin, 1)
+    elif standard_scale is not None:
+        raise ValueError("standard_scale must be 'var', 'group', or None")
+
+    n_groups, n_genes = mean.shape
+    if figsize is None:
+        plot_size = (
+            (max(5, n_groups * 0.55), max(8, n_genes * gene_width))
+            if swap_axes
+            else (max(8, n_genes * gene_width), max(3, n_groups * 0.35))
+        )
+    else:
+        plot_size = figsize
+
+    fig = plt.figure(
+        figsize=(plot_size[0] + legend_width, plot_size[1]),
+    )
+    gs = fig.add_gridspec(
+        1,
+        2,
+        width_ratios=(plot_size[0], legend_width),
+        wspace=(0.28 if swap_axes else 0.04) if pad is None else pad,
+    )
+    ax = fig.add_subplot(gs[0])
+    legend_gs = gs[1].subgridspec(
+        1,
+        2,
+        width_ratios=(1.25, 1),
+        wspace=legend_wspace,
+    )
+    size_host = fig.add_subplot(legend_gs[0])
+    cbar_host = fig.add_subplot(legend_gs[1])
+    size_host.set_axis_off()
+    cbar_host.set_axis_off()
+
+    # Keep both legends compact when swap_axes=True makes the figure very tall.
+    legend_height_ratio = min(0.90, legend_height / plot_size[1])
+    legend_bottom = (1 - legend_height_ratio) / 2
+    size_ax = size_host.inset_axes(
+        [0, legend_bottom, 1, legend_height_ratio]
+    )
+
+    row_index = {label: i for i, label in enumerate(categories)}
+    for label, start, end in positions:
+        if label not in row_index:
+            continue
+        if swap_axes:
+            xy, width, height = (row_index[label], start), 1, end - start
+        else:
+            xy, width, height = (start, row_index[label]), end - start, 1
+        ax.add_patch(
+            Rectangle(
+                xy,
+                width,
+                height,
+                facecolor=box_color,
+                edgecolor=box_edge,
+                linewidth= box_lw ,
+                alpha=box_alpha,
+                zorder=0,
+            )
+        )
+
+    plot_fraction = fraction.T if swap_axes else fraction
+    plot_color = color.T if swap_axes else color
+    y, x = np.indices(plot_color.shape)
+    sizes = dot_size[0] + np.clip(plot_fraction, 0, 1) ** 1.5 * (
+        dot_size[1] - dot_size[0]
+    )
+    dots = ax.scatter(
+        x.ravel() + 0.5,
+        y.ravel() + 0.5,
+        s=sizes.ravel(),
+        c=plot_color.ravel(),
+        cmap=cmap,
+        edgecolors=edgecolors,
+        marker=marker,
+        linewidths=edgelw,
+        zorder=2,
+    )
+
+    if swap_axes:
+        ax.set(
+            xlim=(0, n_groups),
+            ylim=(n_genes, 0),
+            xticks=np.arange(n_groups) + 0.5,
+            yticks=np.arange(n_genes) + 0.5,
+            xticklabels=categories,
+            yticklabels=genes,
+        )
+        ax.tick_params(axis="x", labelrotation=90, labelsize=group_fontsize)
+        ax.tick_params(axis="y", labelsize=gene_fontsize)
+
+        # Marker-gene blocks are vertical after swapping axes. Draw a real
+        # right-side bracket with two horizontal caps for every block.
+        trans = blended_transform_factory(ax.transAxes, ax.transData)
+        for label, start, end in positions:
+            gap = min(marker_gap, max((end - start) / 2 - 1e-6, 0))
+            marker_start = start + gap
+            marker_end = end - gap
+            marker_outer = marker_box_bottom + lheight
+            ax.plot(
+                [marker_box_bottom, marker_outer,
+                 marker_outer, marker_box_bottom],
+                [marker_start, marker_start, marker_end, marker_end],
+                color=box_edge,
+                lw=marker_box_lw,
+                transform=trans,
+                clip_on=False,
+            )
+            ax.text(
+                marker_outer + 0.015,
+                (start + end) / 2,
+                str(label),
+                ha="left",
+                va="center",
+                fontsize=marker_fontsize,
+                transform=trans,
+                clip_on=False,
+            )
+    else:
+        ax.set(
+            xlim=(0, n_genes),
+            ylim=(n_groups, 0),
+            xticks=np.arange(n_genes) + 0.5,
+            yticks=np.arange(n_groups) + 0.5,
+            xticklabels=genes,
+            yticklabels=categories,
+        )
+        ax.tick_params(axis="x", pad=gene_pad)
+        ax.tick_params(axis="y", labelsize=group_fontsize)
+        plt.setp(
+            ax.get_xticklabels(),
+            rotation=90,
+            ha="right",
+            va="center",
+            rotation_mode="anchor",
+            fontsize=gene_fontsize,
+        )
+
+        trans = blended_transform_factory(ax.transData, ax.transAxes)
+        for label, start, end in positions:
+            gap = min(marker_gap, max((end - start) / 2 - 1e-6, 0))
+            marker_start = start + gap
+            marker_end = end - gap
+            marker_top = marker_box_bottom + lheight
+            ax.plot(
+                [marker_start, marker_start, marker_end, marker_end],
+                [marker_box_bottom, marker_top,
+                 marker_top, marker_box_bottom],
+                color=box_edge,
+                lw=marker_box_lw,
+                transform=trans,
+                clip_on=False,
+            )
+            ax.text(
+                (start + end) / 2,
+                marker_box_bottom + lheight / 2,
+                str(label),
+                rotation=0,
+                ha="center",
+                va="top",
+                fontsize=marker_fontsize,
+                transform=trans,
+                clip_on=False,
+            )
+
+    ax.grid(False)
+    cax = cbar_host.inset_axes(
+        [0.18, legend_bottom, 0.30, legend_height_ratio]
+    )
+    cbar = fig.colorbar(dots, cax=cax)
+    cbar.set_label(
+        "Mean expression"
+        if standard_scale is None
+        else "Scaled mean expression",
+        fontsize=colorbar_fontsize,
+    )
+    cbar.ax.tick_params(labelsize=colorbar_fontsize)
+    fraction_levels = np.array([0.25, 0.50, 0.75, 1.00])
+    legend_sizes = dot_size[0] + fraction_levels**1.5 * (
+        dot_size[1] - dot_size[0]
+    )
+    legend_y = np.arange(len(fraction_levels))
+    size_ax.scatter(
+        np.zeros_like(legend_y),
+        legend_y,
+        s=legend_sizes,
+        facecolor="white",
+        edgecolor="#777777",
+        marker=marker,
+        linewidth=0.8,
+    )
+    size_ax.set(
+        xlim=(-0.8, 0.8),
+        ylim=(len(fraction_levels) - 0.25, -0.75),
+        xticks=[],
+        yticks=legend_y,
+        yticklabels=[f"{p:.0%}" for p in fraction_levels],
+    )
+    size_ax.yaxis.tick_right()
+    size_ax.tick_params(
+        axis="y",
+        left=False,
+        right=False,
+        labelleft=False,
+        labelright=True,
+        pad=3,
+        labelsize=legend_fontsize,
+    )
+    size_ax.set_title(
+        "Fraction",
+        fontsize=legend_title_fontsize,
+        pad=6,
+    )
+    for spine in size_ax.spines.values():
+        spine.set_visible(False)
+
+    data = pd.DataFrame(
+        {
+            "group": np.repeat(categories, n_genes),
+            "gene": np.tile(genes, n_groups),
+            "marker_group": np.tile(gene_groups, n_groups),
+            "mean_expression": mean.ravel(),
+            "fraction": fraction.ravel(),
+            "plot_color": color.ravel(),
+        }
+    )
+    if save:
+        with rc_context({'pdf.fonttype': 42, 'ps.fonttype': 42}):
+            fig.savefig(save, bbox_inches='tight', 
+                        dpi=dpi, transparent=transparent)
+    if show:
+        plt.show()
+    return fig, ax, data

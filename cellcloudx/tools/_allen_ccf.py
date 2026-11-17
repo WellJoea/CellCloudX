@@ -362,7 +362,10 @@ class structure_json():
         tree_mtx = pd.DataFrame(tree_mtx, columns=levels, index=struct_df['id'])
         if fill_by_pid:
             tree_mtx[tree_mtx == -10] = np.nan
-            tree_mtx = tree_mtx.fillna(method='ffill', axis=1)
+            try:
+                tree_mtx = tree_mtx.fillna(method='ffill', axis=1)
+            except:
+                tree_mtx = tree_mtx.ffill(axis=1)
         if add_self:
             tree_mtx[tree_mtx.columns.shape[0]] = tree_mtx.index
         return tree_mtx.astype(np.int64)
@@ -397,3 +400,18 @@ def get_itk_label(path=None,):
     itklab.index = itklab.IDX
     itklab['LABEL'] = pd.Categorical(itklab['LABEL'], categories=itklab['LABEL'])
     return itklab, colordict, labeldict, idxdict
+
+
+
+    # annot_df = pd.read_csv(r'D:\01Data\CCFv3\DevCCF_ITK-SNAP_label_3.6.txt', 
+    #                     sep=r'\s+', comment='#', index_col=None, header=None, )
+    # add_annot = pd.DataFrame([[16001, 243,25, 60, 1, 1, 1, 'DPall'],
+    #                         [16114, 255, 72, 102, 1, 1, 1, 'MPall'],])
+    # annot_df = pd.concat([annot_df, add_annot], axis=0).astype(str)
+    # annot_df.columns = ['IDX', 'R', 'G', 'B', 'A', 'VIS', 'MSH', 'LABEL']
+    # annot_df['hex'] = cc.pl.rgb_to_hex(annot_df[[ 'R', 'G', 'B']].astype(np.uint8).values)
+    # annot_df['IDX'] = annot_df['IDX'].astype(str)
+    # annot_df.set_index('IDX', inplace=True)
+
+    # labeldict = dict(zip(annot_df['LABEL'], annot_df['hex']))
+    # annot_df

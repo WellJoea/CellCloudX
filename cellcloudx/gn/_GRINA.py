@@ -20,7 +20,7 @@ from torch_geometric.utils import remove_self_loops
 
 from ._GATEconv import GATEConv
 from ._utilis import seed_torch
-from ..alignment.ccflib.deprecated._wansac  import nnalign
+from ..alignment.m3lib.deprecated._wansac  import nnalign
 
 from tqdm import tqdm
 class GRINA():

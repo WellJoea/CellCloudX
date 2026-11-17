@@ -12,8 +12,7 @@ from matplotlib import pyplot as plt
 import scanpy as sc
 
 import sys
-sys.path.append('/gpfs/home/user19/JupyterCode/')
-from CellCloudX_v126 import cellcloudx as cc
+from .. import cellcloudx as cc
 
 def ground_truth_state(X, Y, Xf, Yf, xlabels=None, knn=1, ylabels=None, alpha=0.5, 
                        kd_method='sknn', use_mnn=False, temp=[1,1], CI=1.0):
@@ -144,6 +143,59 @@ def normalize(X):
     l2x = np.linalg.norm(X, ord=None, axis=1, keepdims=True)
     l2x[l2x == 0] = 1
     return X/l2x #*((self.DF/2.0)**0.5)
+
+def pwreg_GMDs(X, TYs, Xf, Yf,  xlabels=None,  ylabels = None, knn=1, temp=[1e-2,1], CI=0.97, use_mnn=False, agg='mean',
+                 alpha=0.5, 
+                COLOR = ['gray','#e41a1c','#4daf4a','#009db2', 'violet', 'cyan', 'gold']
+                    ):
+    nt = len(TYs)
+    dfs, txs, tys= [], [], []
+    dfs1, scores1 = [], []
+    for i in range(nt):
+        iname = i
+        TX = X 
+        TY = TYs[i]
+        idf = ground_truth_state(TX, TY, Xf, Yf, knn=knn, temp=temp, CI=CI, alpha=alpha, use_mnn=use_mnn)
+
+        if agg == 'mean':
+            mdf = idf.mean(0)
+            mdf['score4'] = idf['score4'].sum(0) /(idf.shape[0]**0.5)
+            mdf['score5'] = idf['score5'].sum(0) /(idf.shape[0]**0.5)
+            mdf.name = iname
+        elif agg == 'sum':
+            mdf = idf.sum(0)
+            mdf.name = iname
+        else:
+            mdf = idf
+
+        if (xlabels is not None) and ylabels is not None:
+            idf0, iscore = ground_truth_state0(TX, TY,  Xf, Yf,
+                                        xlabels=xlabels, ylabels=ylabels, CI=CI)
+            iscore['method'] = iname
+            idf0['method'] = iname
+            dfs1.append(idf0)
+            scores1.append(iscore)
+
+        dfs.append(mdf)
+        txs.append(TX)
+        tys.append(TY)
+
+    dfs = pd.concat(dfs, axis=1)
+
+    if (xlabels is not None) and ylabels is not None:
+        dfs1 = pd.concat(dfs1, axis=0)
+        dfs1['method'] = pd.Categorical(dfs1['method'])
+
+        sims = pd.concat(scores1, axis=0)
+        sims = sims.pivot(columns='types', index='method', values='score')
+
+        stats = pd.concat([dfs.T, dfs1.groupby('method').mean(0), sims], axis=1)
+        stats['distance(mean)'] = -stats['distance(mean)']
+        stats
+
+        return dfs, txs, tys, stats
+    else:
+        return dfs, txs, tys
 
 def pwreg_scores(adata12, MT, MD, knn=1, temp=[1e-2,1], CI=0.97, use_mnn=False, agg='mean',
                  alpha=0.5, labels=None,

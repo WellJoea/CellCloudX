@@ -15,7 +15,6 @@
 ***********************************************************
 '''
 
-from .ccflib import *
-from ._CCF import ccf, ccf_pwr
+from .m3lib import *
+from ._mmPWR import mmPWR, mmpwr
 from ._tracer import Tracer
-# from .ccflib.deprecated._zstack_reconstraction import zstack_reconstraction

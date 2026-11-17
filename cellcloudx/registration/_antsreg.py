@@ -2,12 +2,13 @@ import os
 import numpy as np
 import pandas as pd
 import skimage as ski
-import ants
+
 
 from ..transform._transi import swap_tmat
 ## WARP from antspy
 class antsreg():
     def __init__(self, transtype='SyN', ndim=2, verbose=False,):
+        import ants
         self.ants = ants
         self.transtype= 'Rigid' if transtype == 'rigid' else transtype
         self.ndim= ndim

@@ -4,7 +4,10 @@ import time
 import dash
 from dash import Dash, dcc, html, callback_context, Input, Output, State
 from dash.dependencies import Input, Output, State
-import dash_bootstrap_components as dbc
+try:
+    import dash_bootstrap_components as dbc
+except:
+    pass
 
 from ._plot_wrap import scatter_wrap
 from .._colors import *

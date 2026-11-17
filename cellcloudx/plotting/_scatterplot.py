@@ -191,6 +191,9 @@ def scattersplit(adata, groupby, splitby=None, basis='X_umap',
             basis = basis if axis_label is None else axis_label
             AX.set_ylabel((basis+'1').upper(), fontsize = fontsize)
             AX.set_xlabel((basis+'2').upper(), fontsize = fontsize)
+        else:
+            AX.xaxis.label.set_visible(axis_label is not False)
+            AX.yaxis.label.set_visible(axis_label is not False)
 
         if titles is None:
             AX.set_title(sid,size=fontsize)

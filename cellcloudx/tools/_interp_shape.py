@@ -1,4 +1,3 @@
-from scipy.ndimage import distance_transform_edt,binary_dilation, generate_binary_structure
 from scipy.interpolate import interpn, RBFInterpolator
 import skimage as ski
 from typing import Optional, Union
@@ -11,29 +10,1043 @@ try:
 except ImportError:
     from typing_extensions import Literal
 
-import numpy as np
+from scipy.interpolate import BSpline, CubicSpline, PchipInterpolator
+from scipy.ndimage import (
+    binary_closing,
+    binary_dilation,
+    binary_fill_holes,
+    distance_transform_edt,
+    uniform_filter,
+    distance_transform_edt,binary_dilation, generate_binary_structure
+)
+from scipy.spatial import cKDTree
+from scipy.ndimage import gaussian_filter, shift, uniform_filter
+from skimage.color import rgb2hed, rgb2lab
+from skimage.feature import SIFT, local_binary_pattern
+from skimage.filters import gabor, gaussian, scharr_h, scharr_v
+from skimage.util import img_as_float32
 
 from ..utilis._arrays import list_iter
 
-import numpy as np
 
-def scatterstack(*Xs, figsize=(8,8), samples=None, size=1, sharex=True, sharey=True,  color=None):
-    L = len(Xs)
-    if isinstance(size, (list, tuple)):
-        pointsize = size
+def image_to_points(
+    image,
+    mask=None,
+    step=4,
+    features=("appearance", "gradient", "lbp"),
+    color_space="lab",
+    sigma=1.0,
+    patch_size=7,
+    lbp_points=8,
+    lbp_radius=1,
+    lbp_window=7,
+    gabor_frequencies=(0.1, 0.2),
+    gabor_angles=(0, np.pi / 4, np.pi / 2, 3 * np.pi / 4),
+    normal=True,
+    ngf_eta=None,
+    mind_radius=2.0,
+    mind_angles=8,
+    mind_patch_size=3,
+    mind_rotation_invariant=True,
+    rihog_bins=8,
+    rihog_window=9,
+    hessian_sigmas=(1.0, 2.0, 4.0),
+    sift_kwargs={},
+):
+    """
+    Convert an image into sampled ``[x, y]`` points and local descriptors.
+
+    Except in SIFT mode, points are sampled on a uniform pixel grid and the
+    requested descriptor blocks are concatenated in ``features`` order.
+
+    Parameters
+    ----------
+    image : (H, W) or (H, W, C) array
+        Grayscale or multichannel input image. Integer images are converted
+        with ``img_as_float32``; floating-point values are preserved. For
+        ``color_space='lab'`` or ``'hed'``, the first three channels are
+        interpreted as RGB and floating RGB values must lie in ``[0, 1]``.
+        With ``color_space='raw'``, all channels and their original floating
+        value range are retained. All values must be finite.
+    mask : (H, W) bool array, optional
+        Foreground mask in image coordinates. Only grid points or SIFT
+        keypoints whose mask value is true are retained. Non-Boolean inputs
+        are converted to Boolean, so threshold probability masks before use.
+        Use a tighter mask to suppress irrelevant background and a wider mask
+        to retain uncertain tissue boundaries. If ``None``, use the full image.
+    step : int, default=4
+        Positive grid spacing in pixels. The number of sampled points is
+        approximately the foreground area divided by ``step**2``. Decrease it
+        for denser, more precise sampling; increase it for faster processing
+        and coarser representation. A useful estimate for a target of ``N``
+        points is ``step ~= sqrt(foreground_area / N)``. Ignored in SIFT mode.
+    features : str or sequence of str,
+        default=('appearance', 'gradient', 'lbp')
+        Descriptor blocks to return, concatenated in the supplied order:
+
+        - ``'appearance'``: smoothed grayscale, Lab, HED, or raw channel values;
+        - ``'structure'``: one scalar structural-intensity value for every image;
+        - ``'gradient'``: one Scharr gradient-magnitude value;
+        - ``'ngf'``: a 3-D sign-insensitive normalized-gradient tensor;
+        - ``'patch'``: a zero-mean, L2-normalized local gray patch;
+        - ``'lbp'``: a local uniform-LBP histogram;
+        - ``'gabor'``: orientation-pooled responses, one per frequency;
+        - ``'mind'``: modality-independent local self-similarity values;
+        - ``'rihog'``: rotation-insensitive Fourier gradient histogram;
+        - ``'hessian'``: absolute Hessian eigenvalues at multiple scales;
+        - ``'sift'``: sparse 128-dimensional SIFT descriptors.
+
+        ``'sift'`` must be used alone. ``'appearance'`` retains all selected
+        channels and therefore is not directly comparable between RGB/Lab and
+        grayscale inputs. Use ``'structure'`` for a common one-column intensity
+        block, or omit intensity and use ``gradient/ngf/mind/rihog/hessian`` for
+        cross-platform images. Use identical feature parameters for all images.
+    color_space : {'lab', 'raw', 'hed'}, default='lab'
+        Representation used for a multichannel image. ``'lab'`` converts RGB
+        to perceptual Lab and uses normalized L as the scalar image;
+        ``'hed'`` performs H&E color deconvolution and uses the hematoxylin
+        channel as the scalar image; ``'raw'`` retains every channel and uses
+        their mean as the scalar image. The scalar image supplies gradient,
+        patch, LBP, Gabor, and SIFT features. Use ``'lab'`` for ordinary RGB,
+        ``'hed'`` for H&E sections, and ``'raw'`` for independent fluorescence
+        or measurement channels. It does not alter a 2-D grayscale image.
+    sigma : float, default=1.0
+        Standard deviation, in pixels, of Gaussian smoothing applied before
+        dense feature extraction. Use ``0`` to disable smoothing. Increase it
+        to suppress pixel noise and stabilize gradients; decrease it to retain
+        fine boundaries. Values near ``0.25--0.5 * step`` are a useful start.
+        This parameter controls only the image feature scale.
+        Ignored in SIFT mode.
+    patch_size : int, default=7
+        Positive odd side length, in pixels, of each ``'patch'`` descriptor.
+        Its output dimension is ``patch_size**2``. Larger values capture wider
+        structures and tolerate small translations but reduce localization and
+        increase memory. A common choice is approximately ``2 * step + 1``.
+        Used only when ``'patch'`` is requested.
+    lbp_points : int, default=8
+        Number of circular neighbors in the uniform-LBP code. The LBP output
+        dimension is ``lbp_points + 2``. More points describe angular texture
+        more finely but cost more and can be more noise-sensitive. A common
+        relation is ``lbp_points ~= 8 * lbp_radius``.
+    lbp_radius : float, default=1
+        Positive sampling radius, in pixels, of the LBP neighborhood. Increase
+        it to describe coarser texture and decrease it for finer texture.
+    lbp_window : int, default=7
+        Positive odd side length, in pixels, of the window used to pool local
+        LBP-code proportions. Larger windows give smoother, more
+        translation-tolerant histograms but weaker spatial localization. It
+        should normally be at least ``2 * lbp_radius + 1``.
+    gabor_frequencies : sequence of float, default=(0.1, 0.2)
+        Spatial frequencies in cycles per pixel, each in ``(0, 0.5]``. One
+        output column is produced per frequency after orientation max-pooling.
+        A frequency ``f`` targets a texture wavelength of approximately
+        ``1 / f`` pixels. Add lower frequencies for coarser texture and higher
+        frequencies for finer texture.
+    gabor_angles : sequence of float
+        Gabor orientations in radians. The default uses 0, 45, 90, and 135
+        degrees. Responses are max-pooled over angles, so adding angles improves
+        approximate rotation tolerance and increases computation time without
+        increasing descriptor dimension. Used only when ``'gabor'`` is requested.
+    ngf_eta : float or None, default=None
+        Positive edge-noise scale for ``'ngf'``. If ``None``, use 10% of the
+        90th percentile of foreground gradient magnitudes. The adaptive value
+        makes NGF insensitive to global intensity scaling. NGF is also
+        insensitive to contrast reversal, but its tensor axes still follow the
+        image x/y axes.
+    mind_radius : float, default=2.0
+        Positive radius, in pixels, of the circular MIND sampling ring.
+    mind_angles : int, default=8
+        Number of evenly spaced offsets on the MIND ring and therefore the
+        ``'mind'`` output dimension.
+    mind_patch_size : int, default=3
+        Positive odd window size used to pool squared patch differences for
+        MIND. Larger windows suppress platform noise but blur fine structures.
+    mind_rotation_invariant : bool, default=True
+        If true, sort the ring responses at every point. This removes their
+        angular order and makes MIND approximately invariant to in-plane
+        rotation and reflection while retaining local self-similarity values.
+    rihog_bins : int, default=8
+        Number of unsigned orientation bins before the Fourier magnitude is
+        computed. The ``'rihog'`` dimension is ``rihog_bins // 2 + 1``.
+    rihog_window : int, default=9
+        Positive odd window size used to pool the local gradient histogram.
+    hessian_sigmas : sequence of float, default=(1.0, 2.0, 4.0)
+        Positive Gaussian scales in pixels. ``'hessian'`` returns the two
+        absolute, magnitude-sorted Hessian eigenvalues per scale, for a total
+        dimension of ``2 * len(hessian_sigmas)``. These values are invariant to
+        in-plane axis rotation and to intensity-sign reversal.
+    normal : bool, default=True
+        If true, normalize each dense descriptor block before concatenation.
+        Appearance, structure, gradient, Gabor, and Hessian columns receive a
+        per-image robust median-MAD scaling and division by the square root of
+        their block dimension. Patch, MIND, and RIHOG rows are L2-normalized;
+        LBP receives a Hellinger transform and row normalization; NGF keeps its
+        bounded tensor geometry and is divided by the square root of dimension.
+        Every block is finally multiplied by ``1 / sqrt(number_of_blocks)``.
+        Set false when shared scaling will be applied later. Intrinsic patch,
+        NGF, MIND, RIHOG, and SIFT descriptor construction is always retained.
+
+    Returns
+    -------
+    points : (N, 2) float32 array
+        Sample or keypoint coordinates in ``[x, y]`` pixel order.
+    descriptors : (N, K) float32 array
+        Descriptor rows aligned with ``points``. For dense mode, ``K`` is the
+        sum of the requested block dimensions; for SIFT, ``K=128``.
+
+    Notes
+    -----
+    Use the same extraction parameters and the same physical image scale for
+    all images being compared. After extracting ``FX`` and ``FY`` with
+    ``normal=True``, use
+    :func:`normalize_feature_blocks` with ``pre_normalized=True`` to impose one
+    shared FX/FY scale and optional block weights. If joint
+    scaling is always available, extracting with ``normal=False`` and calling
+    that function with ``pre_normalized=False`` avoids the preliminary
+    per-image scaling.
+
+    The function does not infer pixel size. Images from different scanners or
+    pyramid levels should first be resampled to a common physical pixel size;
+    otherwise pixel-valued radii, windows, frequencies, and Hessian scales do
+    not describe the same tissue scale even though descriptor dimensions match.
+    """
+    image = img_as_float32(np.asarray(image))
+    features = (features,) if isinstance(features, str) else tuple(features)
+
+    if not features:
+        raise ValueError("features cannot be empty")
+    if len(set(features)) != len(features):
+        raise ValueError("features cannot contain duplicates")
+    if color_space not in {"lab", "raw", "hed"}:
+        raise ValueError("color_space must be 'lab', 'raw', or 'hed'")
+    if not isinstance(step, (int, np.integer)) or step < 1:
+        raise ValueError("step must be a positive integer")
+    if not np.isfinite(sigma) or sigma < 0:
+        raise ValueError("sigma must be finite and non-negative")
+    if not np.all(np.isfinite(image)):
+        raise ValueError("image must contain only finite values")
+    if not isinstance(normal, (bool, np.bool_)):
+        raise TypeError("normal must be a boolean")
+
+    if image.ndim == 2:
+        raw_gray = image
+        appearance = image[..., None]
+
+    elif image.ndim == 3 and image.shape[-1] > 0:
+        if color_space == "raw":
+            appearance = image
+            raw_gray = image.mean(axis=-1)
+
+        elif color_space in {"lab", "hed"}:
+            if image.shape[-1] < 3:
+                raise ValueError(
+                    f"color_space={color_space!r} requires at least 3 channels"
+                )
+
+            rgb = image[..., :3]
+            if rgb.min() < 0 or rgb.max() > 1:
+                raise ValueError(
+                    "floating RGB values must be in [0, 1] for Lab/HED conversion"
+                )
+
+            if color_space == "lab":
+                appearance = rgb2lab(rgb).astype(np.float32)
+                raw_gray = appearance[..., 0] / 100.0
+            else:
+                appearance = rgb2hed(rgb).astype(np.float32)
+                raw_gray = appearance[..., 0]
+
+        else:
+            raise ValueError("color_space must be 'lab', 'raw', or 'hed'")
+
     else:
-        pointsize = [size for _ in range(L)]
+        raise ValueError("image must have shape (H, W) or (H, W, C)")
 
-    if color is None or len(color) ==0:
-        color = cc.pl.color_palette(L)
+    h, w = raw_gray.shape
+    if h == 0 or w == 0:
+        raise ValueError("image spatial dimensions cannot be empty")
 
-    fig, ax = plt.subplots(1,1, sharex=sharex, sharey=sharey,  figsize=figsize)
-    for i in range(L):
-        ax.scatter(Xs[i][:,0], Xs[i][:,1], s=pointsize[i], c=color[i],  edgecolors='None',)
-    ax.set_aspect('equal', 'box')
-    plt.show()
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (h, w):
+            raise ValueError("mask shape must match image shape")
 
-import numpy as np
+    # Sparse SIFT point cloud.
+    if features == ("sift",):
+        if mask is not None and not np.any(mask):
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 128), dtype=np.float32),
+            )
+
+        support = raw_gray[mask] if mask is not None else raw_gray.ravel()
+        lo, hi = np.percentile(support, (1, 99))
+        sift_image = np.clip(
+            (raw_gray - lo) / (hi - lo + 1e-8),
+            0,
+            1,
+        ).astype(np.float32)
+
+        sift = SIFT(**sift_kwargs)
+        try:
+            sift.detect_and_extract(sift_image)
+        except RuntimeError as exc:
+            if "found no features" not in str(exc).lower():
+                raise
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 128), dtype=np.float32),
+            )
+
+        yx = getattr(sift, "positions", sift.keypoints)
+        ij = np.rint(yx).astype(np.intp)
+        keep = (
+            (ij[:, 0] >= 0)
+            & (ij[:, 0] < h)
+            & (ij[:, 1] >= 0)
+            & (ij[:, 1] < w)
+        )
+
+        if mask is not None:
+            valid = np.flatnonzero(keep)
+            keep[valid] = mask[ij[valid, 0], ij[valid, 1]]
+
+        return (
+            yx[keep, ::-1].astype(np.float32),
+            sift.descriptors[keep].astype(np.float32),
+        )
+
+    if "sift" in features:
+        raise ValueError("'sift' must be used alone")
+
+    valid_features = {
+        "appearance",
+        "structure",
+        "gradient",
+        "ngf",
+        "patch",
+        "lbp",
+        "gabor",
+        "mind",
+        "rihog",
+        "hessian",
+    }
+    unknown = set(features) - valid_features
+    if unknown:
+        raise ValueError(f"unknown feature: {sorted(unknown)!r}")
+
+    if "patch" in features and (
+        not isinstance(patch_size, (int, np.integer))
+        or patch_size < 1
+        or patch_size % 2 != 1
+    ):
+        raise ValueError("patch_size must be a positive odd integer")
+
+    if "lbp" in features:
+        if not isinstance(lbp_points, (int, np.integer)) or lbp_points < 1:
+            raise ValueError("lbp_points must be a positive integer")
+        if not np.isfinite(lbp_radius) or lbp_radius <= 0:
+            raise ValueError("lbp_radius must be finite and positive")
+        if (
+            not isinstance(lbp_window, (int, np.integer))
+            or lbp_window < 1
+            or lbp_window % 2 != 1
+        ):
+            raise ValueError("lbp_window must be a positive odd integer")
+
+    if "gabor" in features:
+        gabor_frequencies = tuple(gabor_frequencies)
+        gabor_angles = tuple(gabor_angles)
+        if len(gabor_frequencies) == 0 or len(gabor_angles) == 0:
+            raise ValueError("gabor_frequencies and gabor_angles cannot be empty")
+        if any(not np.isfinite(f) or f <= 0 or f > 0.5 for f in gabor_frequencies):
+            raise ValueError("Gabor frequencies must be in (0, 0.5]")
+        if any(not np.isfinite(theta) for theta in gabor_angles):
+            raise ValueError("Gabor angles must be finite")
+
+    if "ngf" in features and (
+        ngf_eta is not None
+        and (not np.isfinite(ngf_eta) or ngf_eta <= 0)
+    ):
+        raise ValueError("ngf_eta must be None or finite and positive")
+
+    if "mind" in features:
+        if not np.isfinite(mind_radius) or mind_radius <= 0:
+            raise ValueError("mind_radius must be finite and positive")
+        if not isinstance(mind_angles, (int, np.integer)) or mind_angles < 4:
+            raise ValueError("mind_angles must be an integer >= 4")
+        if (
+            not isinstance(mind_patch_size, (int, np.integer))
+            or mind_patch_size < 1
+            or mind_patch_size % 2 != 1
+        ):
+            raise ValueError("mind_patch_size must be a positive odd integer")
+        if not isinstance(mind_rotation_invariant, (bool, np.bool_)):
+            raise TypeError("mind_rotation_invariant must be a boolean")
+
+    if "rihog" in features:
+        if not isinstance(rihog_bins, (int, np.integer)) or rihog_bins < 4:
+            raise ValueError("rihog_bins must be an integer >= 4")
+        if (
+            not isinstance(rihog_window, (int, np.integer))
+            or rihog_window < 1
+            or rihog_window % 2 != 1
+        ):
+            raise ValueError("rihog_window must be a positive odd integer")
+
+    if "hessian" in features:
+        hessian_sigmas = tuple(hessian_sigmas)
+        if len(hessian_sigmas) == 0 or any(
+            not np.isfinite(value) or value <= 0
+            for value in hessian_sigmas
+        ):
+            raise ValueError("hessian_sigmas must contain positive finite values")
+
+    # Uniform grid sampling.
+    yy, xx = np.meshgrid(
+        np.arange(step // 2, h, step),
+        np.arange(step // 2, w, step),
+        indexing="ij",
+    )
+    yy, xx = yy.ravel(), xx.ravel()
+
+    if mask is not None:
+        keep = mask[yy, xx]
+        yy, xx = yy[keep], xx[keep]
+
+    if len(xx) == 0:
+        dims = {
+            "appearance": appearance.shape[-1],
+            "structure": 1,
+            "gradient": 1,
+            "ngf": 3,
+            "patch": patch_size**2,
+            "lbp": lbp_points + 2,
+            "gabor": len(gabor_frequencies),
+            "mind": mind_angles,
+            "rihog": rihog_bins // 2 + 1,
+            "hessian": 2 * len(hessian_sigmas),
+        }
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, sum(dims[name] for name in features)), dtype=np.float32),
+        )
+
+    gray = gaussian(
+        raw_gray,
+        sigma=sigma,
+        preserve_range=True,
+    ).astype(np.float32)
+
+    if "appearance" in features:
+        appearance = gaussian(
+            appearance,
+            sigma=sigma,
+            channel_axis=-1,
+            preserve_range=True,
+        ).astype(np.float32)
+
+    if set(features) & {"gradient", "ngf", "rihog"}:
+        gx = scharr_v(gray).astype(np.float32)
+        gy = scharr_h(gray).astype(np.float32)
+        gradient = np.hypot(gx, gy).astype(np.float32)
+
+    blocks = []
+
+    for name in features:
+        if name == "appearance":
+            blocks.append(appearance[yy, xx])
+
+        elif name == "structure":
+            blocks.append(gray[yy, xx, None])
+
+        elif name == "gradient":
+            blocks.append(gradient[yy, xx, None])
+
+        elif name == "ngf":
+            if ngf_eta is None:
+                support = gradient[mask] if mask is not None else gradient.ravel()
+                eta = max(0.1 * np.percentile(support, 90), 1e-6)
+            else:
+                eta = float(ngf_eta)
+
+            gxs = gx[yy, xx]
+            gys = gy[yy, xx]
+            denominator = gxs * gxs + gys * gys + eta * eta
+            blocks.append(np.column_stack([
+                gxs * gxs / denominator,
+                np.sqrt(2.0) * gxs * gys / denominator,
+                gys * gys / denominator,
+            ]))
+
+        elif name == "patch":
+            radius = patch_size // 2
+            padded = np.pad(gray, radius, mode="reflect")
+
+            patches = np.lib.stride_tricks.sliding_window_view(
+                padded,
+                (patch_size, patch_size),
+            )[yy, xx].reshape(len(xx), patch_size * patch_size)
+
+            patches -= patches.mean(axis=1, keepdims=True)
+            patches /= np.linalg.norm(
+                patches,
+                axis=1,
+                keepdims=True,
+            ) + 1e-8
+            blocks.append(patches)
+
+        elif name == "lbp":
+            support = gray[mask] if mask is not None else gray.ravel()
+            lo, hi = np.percentile(support, (1, 99))
+            gray8 = np.clip(
+                (gray - lo) / (hi - lo + 1e-8),
+                0,
+                1,
+            )
+
+            code = local_binary_pattern(
+                (255 * gray8).astype(np.uint8),
+                lbp_points,
+                lbp_radius,
+                method="uniform",
+            )
+
+            hist = np.column_stack([
+                uniform_filter(
+                    (code == value).astype(np.float32),
+                    size=lbp_window,
+                    mode="reflect",
+                )[yy, xx]
+                for value in range(lbp_points + 2)
+            ])
+            blocks.append(hist)
+
+        elif name == "gabor":
+            responses = []
+
+            for frequency in gabor_frequencies:
+                pooled = np.zeros_like(gray)
+
+                for theta in gabor_angles:
+                    real, imag = gabor(
+                        gray,
+                        frequency,
+                        theta=theta,
+                    )
+                    magnitude = np.hypot(real, imag).astype(np.float32)
+                    np.maximum(pooled, magnitude, out=pooled)
+
+                responses.append(pooled[yy, xx])
+
+            blocks.append(np.column_stack(responses))
+
+        elif name == "mind":
+            mind = np.empty((len(xx), mind_angles), dtype=np.float32)
+
+            for iangle in range(mind_angles):
+                theta = 2 * np.pi * iangle / mind_angles
+                shifted = shift(
+                    gray,
+                    shift=(
+                        mind_radius * np.sin(theta),
+                        mind_radius * np.cos(theta),
+                    ),
+                    order=1,
+                    mode="reflect",
+                    prefilter=False,
+                )
+                distance = uniform_filter(
+                    np.square(gray - shifted),
+                    size=mind_patch_size,
+                    mode="reflect",
+                )
+                mind[:, iangle] = distance[yy, xx]
+
+            variance = mind.mean(axis=1, keepdims=True)
+            floor = max(float(np.median(variance)) * 1e-6, 1e-12)
+            mind = np.exp(-mind / np.maximum(variance, floor))
+            mind /= np.maximum(mind.max(axis=1, keepdims=True), 1e-6)
+
+            if mind_rotation_invariant:
+                mind.sort(axis=1)
+                mind = mind[:, ::-1]
+
+            blocks.append(mind)
+
+        elif name == "rihog":
+            angle = np.mod(np.arctan2(gy, gx), np.pi)
+            bin_position = angle * (rihog_bins / np.pi)
+            low = np.floor(bin_position).astype(np.intp) % rihog_bins
+            fraction = bin_position - np.floor(bin_position)
+            high = (low + 1) % rihog_bins
+            histogram = np.empty((len(xx), rihog_bins), dtype=np.float32)
+
+            for ibin in range(rihog_bins):
+                votes = gradient * (
+                    (low == ibin) * (1.0 - fraction)
+                    + (high == ibin) * fraction
+                )
+                pooled = uniform_filter(
+                    votes.astype(np.float32),
+                    size=rihog_window,
+                    mode="reflect",
+                )
+                histogram[:, ibin] = pooled[yy, xx]
+
+            rihog = np.abs(np.fft.rfft(histogram, axis=1)).astype(np.float32)
+            rihog /= np.maximum(
+                np.linalg.norm(rihog, axis=1, keepdims=True),
+                1e-6,
+            )
+            blocks.append(rihog)
+
+        elif name == "hessian":
+            response = []
+
+            for hessian_sigma in hessian_sigmas:
+                scale2 = hessian_sigma**2
+                hxx = scale2 * gaussian_filter(
+                    raw_gray,
+                    sigma=hessian_sigma,
+                    order=(0, 2),
+                    mode="reflect",
+                )[yy, xx]
+                hyy = scale2 * gaussian_filter(
+                    raw_gray,
+                    sigma=hessian_sigma,
+                    order=(2, 0),
+                    mode="reflect",
+                )[yy, xx]
+                hxy = scale2 * gaussian_filter(
+                    raw_gray,
+                    sigma=hessian_sigma,
+                    order=(1, 1),
+                    mode="reflect",
+                )[yy, xx]
+
+                trace = hxx + hyy
+                delta = np.sqrt(
+                    np.maximum((hxx - hyy) ** 2 + 4 * hxy**2, 0)
+                )
+                eigen1 = np.abs(0.5 * (trace - delta))
+                eigen2 = np.abs(0.5 * (trace + delta))
+                response.extend([
+                    np.minimum(eigen1, eigen2),
+                    np.maximum(eigen1, eigen2),
+                ])
+
+            blocks.append(np.column_stack(response))
+
+    if normal and len(xx):
+        block_weight = 1.0 / np.sqrt(len(blocks))
+
+        for ib, (name, block) in enumerate(zip(features, blocks)):
+            if name in {
+                "appearance",
+                "structure",
+                "gradient",
+                "gabor",
+                "hessian",
+            }:
+                center = np.median(block, axis=0)
+                scale = 1.4826 * np.median(np.abs(block - center), axis=0)
+                scale = np.where(
+                    np.isfinite(scale) & (scale > 1e-6),
+                    scale,
+                    1.0,
+                )
+                block = (block - center) / (scale * np.sqrt(block.shape[1]))
+
+            elif name in {"patch", "mind", "rihog"}:
+                block = block / np.maximum(
+                    np.linalg.norm(block, axis=1, keepdims=True),
+                    1e-6,
+                )
+
+            elif name == "lbp":
+                block = np.sqrt(
+                    block
+                    / np.maximum(block.sum(axis=1, keepdims=True), 1e-6)
+                )
+                block /= np.maximum(
+                    np.linalg.norm(block, axis=1, keepdims=True),
+                    1e-6,
+                )
+
+            else:  # Bounded NGF tensor.
+                block = block / np.sqrt(block.shape[1])
+
+            blocks[ib] = block_weight * block
+
+    points = np.column_stack([xx, yy]).astype(np.float32)
+    descriptors = np.concatenate(blocks, axis=1).astype(np.float32)
+
+    return points, descriptors
+
+
+def normalize_feature_blocks(
+    FX,
+    FY,
+    features=("appearance", "gradient"),
+    weights=None,
+    patch_size=7,
+    lbp_points=8,
+    gabor_frequencies=(0.1, 0.2),
+    pre_normalized=True,
+    max_samples=100_000,
+    eps=1e-6,
+    random_state=0,
+    mind_angles=8,
+    rihog_bins=8,
+    hessian_sigmas=(1.0, 2.0, 4.0),
+):
+    """
+    Jointly normalize and weight heterogeneous FX/FY feature blocks.
+
+    The column layout is reconstructed from ``features`` and the descriptor
+    parameters used by :func:`image_to_points`. The appearance dimension is
+    inferred from the remaining columns, so grayscale, Lab/HED, and arbitrary
+    raw-channel inputs are supported without a separate channel argument.
+
+    Parameters
+    ----------
+    FX : (NX, K) array
+        Descriptor matrix for the fixed point set. It must be nonempty, finite,
+        and have the same columns and block order as ``FY``.
+    FY : (NY, K) array
+        Descriptor matrix for the moving point set.
+    features : str or sequence of str, default=('appearance', 'gradient')
+        Dense feature blocks and their column order. Use exactly the same value
+        that was passed to :func:`image_to_points`. SIFT is not supported here.
+    weights : mapping, sequence, or None, default=None
+        Non-negative weights assigned to whole blocks in squared Euclidean
+        distance. A mapping is indexed by feature name; a sequence follows
+        ``features`` order. Values are normalized to sum to one. If ``None``,
+        every block receives equal weight. The descriptors are multiplied by
+        ``sqrt(weight)``, so the squared feature distance uses the requested
+        weight rather than its square.
+    patch_size : int, default=7
+        Patch side length used during extraction. It defines a block of
+        ``patch_size**2`` columns and must match both FX and FY.
+    lbp_points : int, default=8
+        Number of LBP neighbors used during extraction. It defines a block of
+        ``lbp_points + 2`` columns and must match both FX and FY.
+    gabor_frequencies : sequence of float, default=(0.1, 0.2)
+        Frequencies used during extraction. Their count defines the Gabor block
+        dimension and must match both FX and FY.
+    mind_angles : int, default=8
+        Number of MIND ring directions used during extraction. It defines the
+        MIND block dimension and must match both FX and FY.
+    rihog_bins : int, default=8
+        Number of orientation bins used during extraction. The RIHOG block has
+        ``rihog_bins // 2 + 1`` columns and must match both inputs.
+    hessian_sigmas : sequence of float, default=(1.0, 2.0, 4.0)
+        Hessian scales used during extraction. Their count defines a block of
+        ``2 * len(hessian_sigmas)`` columns and must match both inputs.
+    pre_normalized : bool, default=True
+        Set true when FX and FY came from ``image_to_points(normal=True)``.
+        Intrinsic patch, NGF, MIND, RIHOG, and Hellinger-LBP geometry is then
+        preserved while final block weights are refreshed. Set false for raw
+        descriptors from ``normal=False``; LBP then receives its Hellinger
+        transform here. Continuous blocks receive a shared robust FX/FY scaling
+        in either case.
+    max_samples : int, default=100000
+        Maximum number of rows drawn from each matrix to estimate shared median
+        and MAD values. Balanced sampling prevents the larger point set from
+        dominating the scale estimate.
+    eps : float, default=1e-6
+        Positive threshold for constant robust scales, histogram sums, and row
+        norms. Degenerate continuous scales are replaced by one.
+    random_state : int, array-like, None, or NumPy SeedSequence, default=0
+        Seed passed to ``numpy.random.default_rng`` for reproducible balanced
+        row sampling.
+
+    Returns
+    -------
+    FX_normalized : (NX, K) float32 array
+        Jointly normalized and block-weighted FX descriptors.
+    FY_normalized : (NY, K) float32 array
+        FY descriptors transformed with the same continuous-block statistics.
+    center : dict
+        Shared per-column medians for appearance, structure, gradient, Gabor,
+        and Hessian blocks. Intrinsically normalized block entries are ``None``.
+    scale : dict
+        Shared MAD scales for continuous blocks. Intrinsically normalized block
+        entries are ``None``.
+
+    Notes
+    -----
+    For a continuous block of dimension ``d_b``, the returned representation is
+    ``sqrt(w_b / d_b) * (F_b - center_b) / scale_b``. Consequently, its
+    squared-distance contribution is the weighted mean per-column distance,
+    rather than a sum that automatically favors high-dimensional blocks.
+    """
+    FX = np.asarray(FX, dtype=np.float32)
+    FY = np.asarray(FY, dtype=np.float32)
+    features = (features,) if isinstance(features, str) else tuple(features)
+
+    if FX.ndim != 2 or FY.ndim != 2:
+        raise ValueError("FX and FY must be two-dimensional arrays")
+    if FX.shape[1] != FY.shape[1]:
+        raise ValueError("FX and FY must have the same feature dimension")
+    if len(FX) == 0 or len(FY) == 0:
+        raise ValueError("FX and FY cannot be empty")
+    if not np.all(np.isfinite(FX)) or not np.all(np.isfinite(FY)):
+        raise ValueError("FX and FY must contain only finite values")
+    if not features or len(set(features)) != len(features):
+        raise ValueError("features must be nonempty and contain no duplicates")
+    if "sift" in features:
+        raise ValueError("SIFT must be normalized separately")
+
+    valid_features = {
+        "appearance",
+        "structure",
+        "gradient",
+        "ngf",
+        "patch",
+        "lbp",
+        "gabor",
+        "mind",
+        "rihog",
+        "hessian",
+    }
+    unknown = set(features) - valid_features
+    if unknown:
+        raise ValueError(f"unknown feature: {sorted(unknown)!r}")
+    if (
+        not isinstance(patch_size, (int, np.integer))
+        or patch_size < 1
+        or patch_size % 2 != 1
+    ):
+        raise ValueError("patch_size must be a positive odd integer")
+    if not isinstance(lbp_points, (int, np.integer)) or lbp_points < 1:
+        raise ValueError("lbp_points must be a positive integer")
+    if not isinstance(pre_normalized, (bool, np.bool_)):
+        raise TypeError("pre_normalized must be a boolean")
+    if not isinstance(max_samples, (int, np.integer)) or max_samples < 1:
+        raise ValueError("max_samples must be a positive integer")
+    if not np.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+
+    gabor_frequencies = tuple(gabor_frequencies)
+    if "gabor" in features and len(gabor_frequencies) == 0:
+        raise ValueError("gabor_frequencies cannot be empty")
+    if not isinstance(mind_angles, (int, np.integer)) or mind_angles < 4:
+        raise ValueError("mind_angles must be an integer >= 4")
+    if not isinstance(rihog_bins, (int, np.integer)) or rihog_bins < 4:
+        raise ValueError("rihog_bins must be an integer >= 4")
+
+    hessian_sigmas = tuple(hessian_sigmas)
+    if "hessian" in features and (
+        len(hessian_sigmas) == 0
+        or any(
+            not np.isfinite(value) or value <= 0
+            for value in hessian_sigmas
+        )
+    ):
+        raise ValueError("hessian_sigmas must contain positive finite values")
+
+    dims = {
+        "structure": 1,
+        "gradient": 1,
+        "ngf": 3,
+        "patch": patch_size**2,
+        "lbp": lbp_points + 2,
+        "gabor": len(gabor_frequencies),
+        "mind": mind_angles,
+        "rihog": rihog_bins // 2 + 1,
+        "hessian": 2 * len(hessian_sigmas),
+    }
+    known_dim = sum(dims[name] for name in features if name != "appearance")
+
+    if "appearance" in features:
+        dims["appearance"] = FX.shape[1] - known_dim
+        if dims["appearance"] < 1:
+            raise ValueError("feature dimension is inconsistent with parameters")
+    elif known_dim != FX.shape[1]:
+        raise ValueError("feature dimension is inconsistent with parameters")
+
+    if weights is None:
+        block_weights = np.ones(len(features), dtype=float)
+    elif isinstance(weights, dict):
+        missing = set(features) - set(weights)
+        if missing:
+            raise ValueError(f"missing feature weights: {sorted(missing)!r}")
+        block_weights = np.asarray([weights[name] for name in features], dtype=float)
+    else:
+        block_weights = np.asarray(weights, dtype=float)
+        if block_weights.shape != (len(features),):
+            raise ValueError("weights must have one value per feature block")
+
+    if not np.all(np.isfinite(block_weights)) or np.any(block_weights < 0):
+        raise ValueError("weights must be finite and non-negative")
+    if not np.any(block_weights > 0):
+        raise ValueError("at least one feature weight must be positive")
+    block_weights /= block_weights.sum()
+
+    n = min(len(FX), len(FY), max_samples)
+    rng = np.random.default_rng(random_state)
+    ix = rng.choice(len(FX), n, replace=False)
+    iy = rng.choice(len(FY), n, replace=False)
+
+    Xout, Yout = [], []
+    center, scale = {}, {}
+    start = 0
+
+    for name, weight in zip(features, block_weights):
+        stop = start + dims[name]
+        Xb = FX[:, start:stop].copy()
+        Yb = FY[:, start:stop].copy()
+
+        if name in {
+            "appearance",
+            "structure",
+            "gradient",
+            "gabor",
+            "hessian",
+        }:
+            Z = np.concatenate([Xb[ix], Yb[iy]], axis=0)
+            cb = np.median(Z, axis=0)
+            sb = 1.4826 * np.median(np.abs(Z - cb), axis=0)
+            sb = np.where(np.isfinite(sb) & (sb > eps), sb, 1.0)
+            Xb = (Xb - cb) / (sb * np.sqrt(dims[name]))
+            Yb = (Yb - cb) / (sb * np.sqrt(dims[name]))
+            center[name], scale[name] = cb, sb
+
+        elif name in {"patch", "mind", "rihog"}:
+            Xb /= np.maximum(np.linalg.norm(Xb, axis=1, keepdims=True), eps)
+            Yb /= np.maximum(np.linalg.norm(Yb, axis=1, keepdims=True), eps)
+            center[name] = scale[name] = None
+
+        elif name == "lbp":
+            if not pre_normalized:
+                if np.any(Xb < 0) or np.any(Yb < 0):
+                    raise ValueError("raw LBP histogram values must be non-negative")
+                Xb = np.sqrt(Xb / np.maximum(Xb.sum(axis=1, keepdims=True), eps))
+                Yb = np.sqrt(Yb / np.maximum(Yb.sum(axis=1, keepdims=True), eps))
+            Xb /= np.maximum(np.linalg.norm(Xb, axis=1, keepdims=True), eps)
+            Yb /= np.maximum(np.linalg.norm(Yb, axis=1, keepdims=True), eps)
+            center[name] = scale[name] = None
+
+        else:  # Bounded NGF tensor.
+            if pre_normalized:
+                Xb *= np.sqrt(len(features))
+                Yb *= np.sqrt(len(features))
+            else:
+                Xb /= np.sqrt(dims[name])
+                Yb /= np.sqrt(dims[name])
+            center[name] = scale[name] = None
+
+        block_scale = np.sqrt(weight)
+        Xout.append(block_scale * Xb)
+        Yout.append(block_scale * Yb)
+        start = stop
+
+    return (
+        np.concatenate(Xout, axis=1).astype(np.float32),
+        np.concatenate(Yout, axis=1).astype(np.float32),
+        center,
+        scale,
+    )
+
+def shared_robust_scale(
+    FX,
+    FY,
+    max_samples=100_000,
+    eps=1e-6,
+    random_state=0,
+):
+    """
+    Apply a shared robust per-feature scaling to two descriptor matrices.
+
+    The function estimates one center and scale from equally sized random
+    samples of ``FX`` and ``FY`` and applies them to both matrices. Sharing the
+    transformation keeps corresponding feature dimensions comparable without
+    allowing the larger point set to dominate the estimate.
+
+    Parameters
+    ----------
+    FX : (NX, K) array
+        First descriptor matrix. Rows are points and columns are feature
+        dimensions. It must be nonempty and contain only finite values.
+    FY : (NY, K) array
+        Second descriptor matrix with the same ``K`` columns as ``FX``. It must
+        be nonempty and contain only finite values.
+    max_samples : int, default=100000
+        Maximum number of rows sampled from each matrix. The actual number per
+        matrix is ``min(NX, NY, max_samples)``. Increase it for a more stable
+        estimate on heterogeneous million-point data; decrease it to reduce
+        scaling time and temporary memory. Values from 50,000 to 200,000 are
+        usually sufficient for large dense point sets.
+    eps : float, default=1e-6
+        Positive threshold used to identify an effectively constant feature.
+        If its MAD-based scale is not finite or is no greater than ``eps``, the
+        scale is set to 1 to avoid division by zero. This is a numerical
+        threshold, not a regularization strength; the default is normally kept.
+    random_state : int, array-like, None, or NumPy SeedSequence, default=0
+        Seed passed to ``numpy.random.default_rng`` for row subsampling. Keep a
+        fixed integer for reproducible scaling, change it to draw another
+        sample, or use ``None`` for nondeterministic sampling.
+
+    Returns
+    -------
+    FX_scaled : (NX, K) array
+        ``FX`` transformed as ``(FX - center) / scale``.
+    FY_scaled : (NY, K) array
+        ``FY`` transformed with the same ``center`` and ``scale``.
+    center : (K,) array
+        Per-feature median of the combined, balanced sample.
+    scale : (K,) array
+        Robust scale ``1.4826 * median(abs(Z - center))``. Degenerate columns
+        have scale 1.
+
+    Notes
+    -----
+    This function is intended for continuous feature blocks whose columns need
+    a common scale, especially appearance and gradient descriptors extracted
+    from two images. Avoid applying it blindly to L2-normalized patch or SIFT
+    descriptors because per-column rescaling changes their original metric.
+    """
+    FX = np.asarray(FX, dtype=np.float32)
+    FY = np.asarray(FY, dtype=np.float32)
+
+    if FX.ndim != 2 or FY.ndim != 2:
+        raise ValueError("FX and FY must be two-dimensional arrays")
+    if FX.shape[1] != FY.shape[1]:
+        raise ValueError("FX and FY must have the same feature dimension")
+    if len(FX) == 0 or len(FY) == 0:
+        raise ValueError("FX and FY cannot be empty")
+    if not np.all(np.isfinite(FX)) or not np.all(np.isfinite(FY)):
+        raise ValueError("FX and FY must contain only finite values")
+    if not isinstance(max_samples, (int, np.integer)) or max_samples < 1:
+        raise ValueError("max_samples must be a positive integer")
+    if not np.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive")
+
+    n = min(len(FX), len(FY), max_samples)
+    rng = np.random.default_rng(random_state)
+
+    Z = np.concatenate([
+        FX[rng.choice(len(FX), n, replace=False)],
+        FY[rng.choice(len(FY), n, replace=False)],
+    ])
+
+    center = np.median(Z, axis=0)
+    scale = 1.4826 * np.median(np.abs(Z - center), axis=0)
+    scale = np.where(
+        np.isfinite(scale) & (scale > eps),
+        scale,
+        1.0,
+    )
+
+    return (
+        (FX - center) / scale,
+        (FY - center) / scale,
+        center,
+        scale,
+    )
+
 
 def rawgrid2pts(images, scale=1, interp_weight=True, points=None, weight=None, method = 'linear', **kargs ):
     shp = images.shape 
@@ -104,6 +1117,580 @@ def grayimg2pts(images, scale=1, inverse_weight=False, sample=None, vmin=0., see
     else:
         kidx = np.ones_like(weigth, dtype=bool)
     return points, weigth, kidx
+
+
+def _bspline_matrix(z, n_basis, degree):
+    """Construct an open-uniform B-spline design matrix."""
+    n_inner = n_basis - degree - 1
+
+    inner = (
+        np.linspace(0.0, 1.0, n_inner + 2)[1:-1]
+        if n_inner > 0
+        else np.empty(0)
+    )
+
+    knots = np.r_[
+        np.zeros(degree + 1),
+        inner,
+        np.ones(degree + 1),
+    ]
+
+    return BSpline(
+        knots,
+        np.eye(n_basis),
+        degree,
+        extrapolate=False,
+    )(np.asarray(z, dtype=float))
+
+def apply_slice_z(values, z_obs, z_new, method="linear", smooth=0.1,
+                  delta=1e-8, n_basis=None, degree=3, z_bandwidth=None,
+                  reliability=None, chunk_size=50_000, _cache=None):
+    """Apply the shared shape/feature operator along the first (slice) axis.
+
+    Arrays have shape (n_observed, ...); the result has shape (n_target, ...).
+    Reliability is nonnegative and broadcasts to values; zero excludes an
+    observation. Linear uses normalized weights, Gaussian uses weighted
+    averaging, and pspline uses weighted fitting. PCHIP and natural cubic
+    retain their exact interpolants: positive reliability selects valid knots
+    without warping z or replacing the requested spline with a rational curve.
+    Missing signals never extrapolate beyond their reliable observed range;
+    one reliable plane supports that exact plane only.
+    _cache is an optional private cache for fixed spline bases and bounded
+    exact local transfer weights; its limit_bytes controls retained weights.
+    """
+    methods = {"linear", "pchip", "cubic", "gaussian", "pspline"}
+    if method not in methods:
+        raise ValueError(f"method must be one of {sorted(methods)}.")
+    z_obs = np.asarray(z_obs, dtype=float)
+    z_new = np.atleast_1d(np.asarray(z_new, dtype=float))
+    values = np.asarray(values, dtype=float)
+    if (z_obs.ndim != 1 or z_new.ndim != 1 or len(z_obs) < 2
+            or values.ndim < 1 or values.shape[0] != len(z_obs)):
+        raise ValueError("values must have first dimension len(z_obs), with at least two slices.")
+    if (not np.isfinite(z_obs).all() or not np.isfinite(z_new).all()
+            or np.any(np.diff(z_obs) <= 0) or np.isinf(values).any()):
+        raise ValueError("z_obs must be finite and increasing; z_new/values cannot contain infinity.")
+    if len(z_new) and (z_new.min() < z_obs[0] or z_new.max() > z_obs[-1]):
+        raise ValueError("z_new must lie inside the observed z range.")
+    shape = values.shape
+    Y = values.reshape(len(z_obs), -1)
+    shared_channels = 1
+    if reliability is None:
+        R = np.ones((len(z_obs), 1))
+    else:
+        R = np.asarray(reliability, dtype=float)
+        if not np.isfinite(R).all() or (R < 0).any():
+            raise ValueError("reliability must be finite and nonnegative.")
+        if R.ndim == 0:
+            R = np.full((len(z_obs), 1), R.item())
+        elif R.shape[0] == len(z_obs) and R.size == len(z_obs):
+            R = R.reshape(len(z_obs), 1)
+        elif method == "pspline" and values.ndim > 2 and shape[-1] > 0 and R.shape[-1] == 1:
+            shared_channels = shape[-1]
+            R = np.broadcast_to(R, shape[:-1] + (1,)).reshape(len(z_obs), -1)
+        else:
+            R = np.broadcast_to(R, shape).reshape(len(z_obs), -1)
+    if shared_channels > 1:
+        finite = (np.isfinite(values) & (R.reshape(shape[:-1] + (1,)) > 0)).reshape(len(z_obs), -1)
+    else:
+        finite = np.isfinite(Y) & (R > 0)
+    result = np.full((len(z_new), Y.shape[1]), np.nan)
+    if method in ("linear", "pchip", "cubic"):
+        if finite.all():
+            groups = np.zeros(Y.shape[1], dtype=int)
+            count_groups = int(Y.shape[1] > 0)
+        else:
+            patterns, groups = np.unique(np.packbits(finite, axis=0).T,
+                                         axis=0, return_inverse=True)
+            count_groups = len(patterns)
+        for group in range(count_groups):
+            columns = np.flatnonzero(groups == group)
+            valid = finite[:, columns[0]]
+            count = int(valid.sum())
+            if count == 1:
+                rows = z_new == z_obs[valid][0]
+                result[np.ix_(rows, columns)] = Y[valid][:, columns]
+            elif count > 1:
+                z = z_obs[valid]
+                rows = (z_new >= z[0]) & (z_new <= z[-1])
+                q = z_new[rows]
+                data = Y[valid][:, columns]
+                r = R[valid] if R.shape[1] == 1 else R[valid][:, columns]
+                if method == "linear":
+                    interval = np.clip(np.searchsorted(z, q, side="right") - 1, 0, len(z) - 2)
+                    dz = np.diff(z)[interval, None]
+                    t = (q[:, None] - z[interval, None]) / dz
+                    if reliability is None:
+                        fraction = t
+                    else:
+                        scale = np.maximum(r[interval], r[interval + 1])
+                        left, right = r[interval] / scale, r[interval + 1] / scale
+                        mass = (1 - t) * left + t * right
+                        fraction = np.divide(t * right, mass, out=np.broadcast_to(t, mass.shape).copy(),
+                                             where=mass > 0)
+                    out = (1 - fraction) * data[interval] + fraction * data[interval + 1]
+                elif method == "pchip":
+                    out = PchipInterpolator(z, data, axis=0)(q)
+                else:
+                    out = CubicSpline(z, data, axis=0, bc_type="natural")(q)
+                result[np.ix_(rows, columns)] = out
+    elif method == "gaussian":
+        if z_bandwidth is None:
+            z_bandwidth = float(np.median(np.diff(z_obs)))
+        if not np.isfinite(z_bandwidth) or z_bandwidth <= 0:
+            raise ValueError("z_bandwidth must be finite and positive.")
+        logw = -0.5 * ((z_new[:, None] - z_obs[None, :]) / z_bandwidth) ** 2
+        if len(z_new):
+            logw -= logw.max(axis=1, keepdims=True)
+        W = np.exp(logw)
+        W /= W.sum(axis=1, keepdims=True)
+        Rc = np.where(finite, R, 0.0)
+        scale = Rc.max(axis=0, keepdims=True)
+        np.divide(Rc, scale, out=Rc, where=scale > 0)
+        mass = W @ Rc
+        sums = W @ (np.where(finite, Y, 0.0) * Rc)
+        np.divide(sums, mass, out=result, where=mass > 0)
+        # A missing nearest plane can make all remaining Gaussian weights underflow.
+        for j in np.flatnonzero(((mass == 0) & (finite.sum(axis=0) > 1)).any(axis=0)):
+            rows = np.flatnonzero(mass[:, j] == 0)
+            valid = finite[:, j]
+            r = R[valid, 0] if R.shape[1] == 1 else R[valid, j]
+            weights = logw[np.ix_(rows, valid)] + np.log(r)[None, :]
+            weights = np.exp(weights - weights.max(axis=1, keepdims=True))
+            result[rows, j] = (weights @ Y[valid, j]) / weights.sum(axis=1)
+    else:
+        if (not np.isfinite(smooth) or smooth < 0 or not np.isfinite(delta)
+                or delta < 0 or int(chunk_size) != chunk_size or chunk_size < 1):
+            raise ValueError("smooth/delta must be finite and nonnegative; chunk_size must be positive.")
+        degree = min(int(degree), len(z_obs) - 1)
+        if degree < 0:
+            raise ValueError("degree must be nonnegative.")
+        if n_basis is None:
+            n_basis = min(12, max(degree + 1, len(z_obs)))
+        n_basis = max(degree + 1, int(n_basis))
+        z0, z1 = z_obs[[0, -1]]
+        basis_key = (z_obs.tobytes(), n_basis, degree, float(smooth), float(delta))
+        query = z_new.tobytes()
+        if _cache is not None and _cache.get("basis_key") == basis_key:
+            B, penalty = _cache["B"], _cache["penalty"]
+        else:
+            B = _bspline_matrix((z_obs - z0) / (z1 - z0), n_basis, degree)
+            D2 = np.diff(np.eye(n_basis), n=2, axis=0)
+            penalty = smooth * (D2.T @ D2) + delta * np.eye(n_basis)
+            if _cache is not None:
+                limit = _cache.get("limit_bytes", 0)
+                _cache.clear()
+                _cache.update(basis_key=basis_key, B=B, penalty=penalty,
+                              queries={}, query_bytes=0, hats={}, used_bytes=0,
+                              limit_bytes=limit)
+        Bq = None if _cache is None else _cache["queries"].get(query)
+        if Bq is None:
+            Bq = _bspline_matrix((z_new - z0) / (z1 - z0), n_basis, degree)
+            size = Bq.nbytes + len(query)
+            if (_cache is not None and len(_cache["queries"]) < 512
+                    and _cache["query_bytes"] + size <= 1024 ** 2):
+                _cache["queries"][query] = Bq
+                _cache["query_bytes"] += size
+
+        def transfer(weights, rhs_count):
+            # The adjoint solves for output weights instead of every gene RHS.
+            # Ill-conditioned/rank-deficient fits retain the forward path below.
+            hat = None
+            if _cache is not None and delta > 0 and 0 < len(z_new) < rhs_count:
+                key = (query, weights.shape, weights.tobytes())
+                if key in _cache["hats"]:
+                    hat = _cache["hats"][key]
+                else:
+                    A = np.einsum("si,sv,sj->vij", B, weights, B)
+                    A += penalty[None, :, :]
+                    try:
+                        if np.isfinite(A).all() and np.all(np.linalg.cond(A) <= 1e6):
+                            rhs = np.broadcast_to(Bq.T, (len(A), n_basis, len(z_new)))
+                            adjoint = np.linalg.solve(A.swapaxes(1, 2), rhs)
+                            hat = np.einsum("si,viq,sv->qvs", B, adjoint, weights)
+                    except np.linalg.LinAlgError:
+                        hat = None
+                    if hat is not None:
+                        size = hat.nbytes + len(query) + len(key[2]) + 8 * len(weights.shape)
+                        if _cache["used_bytes"] + size <= _cache.get("limit_bytes", 0):
+                            _cache["hats"][key] = hat
+                            _cache["used_bytes"] += size
+            return hat
+
+        if finite.all() and (R.shape[1] == 1 or (R.shape[1] > 1 and np.all(R == R[:, :1]))):
+            R = R[:, :1]
+            hat = transfer(R, Y.shape[1])
+            if hat is not None:
+                result = hat[:, 0] @ Y
+            elif smooth == 0 and delta == 0:
+                weight = np.sqrt(R)
+                coef = np.linalg.lstsq(weight * B, weight * Y, rcond=None)[0]
+                result = Bq @ coef
+            else:
+                A = B.T @ (R * B) + penalty
+                rhs = B.T @ (R * Y)
+                try:
+                    coef = np.linalg.solve(A, rhs)
+                except np.linalg.LinAlgError:
+                    coef = np.linalg.lstsq(A, rhs, rcond=None)[0]
+                result = Bq @ coef
+        else:
+            channels = max(1, shape[-1]) if values.ndim > 2 else 1
+            step = max(channels, int(chunk_size) // channels * channels)
+            if _cache is not None and shared_channels > 1 and finite.all():
+                step = channels * max(1, int(chunk_size) // max(n_basis ** 2, len(z_obs)))
+            for start in range(0, Y.shape[1], step):
+                stop = min(start + step, Y.shape[1])
+                common = shared_channels > 1 and finite[:, start:stop].all()
+                if common:
+                    Rc = R[:, start // channels:stop // channels]
+                elif shared_channels > 1:
+                    Rc = R[:, start // channels:stop // channels, None]
+                    Rc = (Rc * finite[:, start:stop].reshape(len(z_obs), -1, channels)).reshape(len(z_obs), -1)
+                else:
+                    Rc = R if R.shape[1] == 1 else R[:, start:stop]
+                    Rc = Rc * finite[:, start:stop]
+                Yc = Y[:, start:stop] if common else np.where(finite[:, start:stop], Y[:, start:stop], 0.0)
+                # Same point-wise weights share one factorization across channels.
+                if channels > 1:
+                    if common:
+                        weights = Rc
+                        shared = np.ones(weights.shape[1], dtype=bool)
+                    else:
+                        weights = Rc.reshape(len(z_obs), -1, channels)
+                        shared = np.all(weights == weights[:, :, :1], axis=(0, 2))
+                        weights = weights[:, :, 0]
+                    points = np.flatnonzero(shared & ((weights > 0).sum(axis=0) > 1))
+                    if len(points):
+                        weights = weights[:, points]
+                        data = Yc.reshape(len(z_obs), -1, channels)[:, points]
+                        target = result[:, start:stop].reshape(len(z_new), (stop - start) // channels, channels)
+                        hat = transfer(weights, channels)
+                        if hat is not None:
+                            target[:, points] = np.einsum("qvs,svc->qvc", hat, data)
+                        elif smooth == 0 and delta == 0:
+                            weight = np.sqrt(weights)
+                            coef = np.stack([
+                                np.linalg.lstsq(weight[:, j, None] * B,
+                                                weight[:, j, None] * data[:, j], rcond=None)[0]
+                                for j in range(len(points))
+                            ])
+                            target[:, points] = np.einsum("qi,vic->qvc", Bq, coef)
+                        else:
+                            A = np.einsum("si,sv,sj->vij", B, weights, B)
+                            A += penalty[None, :, :]
+                            rhs = np.einsum("si,sv,svc->vic", B, weights, data)
+                            try:
+                                coef = np.linalg.solve(A, rhs)
+                            except np.linalg.LinAlgError:
+                                coef = np.stack([np.linalg.lstsq(a, b, rcond=None)[0] for a, b in zip(A, rhs)])
+                            target[:, points] = np.einsum("qi,vic->qvc", Bq, coef)
+                    if common:
+                        columns = np.empty(0, dtype=int)
+                    else:
+                        columns = np.flatnonzero(np.repeat(~shared, channels) & ((Rc > 0).sum(axis=0) > 1))
+                else:
+                    columns = np.flatnonzero((Rc > 0).sum(axis=0) > 1)
+                if len(columns):
+                    Rc = Rc[:, columns]
+                    Yc = Yc[:, columns]
+                    if smooth == 0 and delta == 0:
+                        weight = np.sqrt(Rc)
+                        coef = np.column_stack([
+                            np.linalg.lstsq(weight[:, j, None] * B, weight[:, j] * Yc[:, j], rcond=None)[0]
+                            for j in range(len(columns))
+                        ])
+                    else:
+                        A = np.einsum("si,sv,sj->vij", B, Rc, B)
+                        A += penalty[None, :, :]
+                        rhs = np.einsum("si,sv,sv->vi", B, Rc, Yc)
+                        try:
+                            coef = np.linalg.solve(A, rhs[..., None])[..., 0].T
+                        except np.linalg.LinAlgError:
+                            coef = np.stack([np.linalg.lstsq(a, b, rcond=None)[0] for a, b in zip(A, rhs)]).T
+                    result[:, start + columns] = Bq @ coef
+    if not finite.all():
+        # Removing observations must not silently extend their z coverage.
+        count = finite.sum(axis=0)
+        lo = np.where(finite, z_obs[:, None], np.inf).min(axis=0)
+        hi = np.where(finite, z_obs[:, None], -np.inf).max(axis=0)
+        supported = ((z_new[:, None] >= lo) & (z_new[:, None] <= hi)
+                     & (count[None, :] > 0))
+        result[~supported] = np.nan
+        columns = np.flatnonzero(count == 1)
+        valid = np.argmax(finite[:, columns], axis=0)
+        result[:, columns] = np.where(z_new[:, None] == z_obs[valid], Y[valid, columns], np.nan)
+    return result.reshape((len(z_new),) + shape[1:])
+
+
+def interpolate_slices(
+    points,
+    z_obs,
+    z_new,
+    method="pspline",
+    grid_scale=0.75,
+    radius_scale=1.0,
+    margin=4,
+    closing_iterations=1,
+    fill_holes=True,
+    smooth=0.1,
+    delta=1e-8,
+    n_basis=None,
+    degree=3,
+    z_bandwidth=None,
+    reliability=None,
+    chunk_size=50_000,
+    n_points="density",
+    jitter=True,
+    sampling=True,
+    random_state=0,
+    return_info=False,
+    return_z_weights=True,
+):
+    """
+    Reconstruct intermediate point-cloud slices through SDF interpolation.
+
+    Shape methods
+    -------------
+    linear   : local piecewise-linear SDF interpolation.
+    pchip    : local shape-preserving cubic Hermite interpolation.
+    cubic    : natural cubic spline; smooth but may overshoot.
+    gaussian : Gaussian kernel regression along z.
+    pspline  : penalized B-spline with optional reliability weights.
+
+    Sampling
+    --------
+    sampling=True
+        Sample the number of points specified by n_points.
+
+    sampling=False
+        Return all foreground grid points. In this case, n_points is ignored.
+
+    jitter=True
+        Randomly perturb each selected point inside its grid cell.
+
+    jitter=False
+        Keep points at the grid-cell centers.
+    Returns
+    -------
+    sampled : list of (Ni, 2) arrays
+        Interpolated xy point clouds corresponding to z_new.
+    info : dict, optional
+        Returned as ``(sampled, info)`` only when return_info=True. Contains
+        the shared x/y axes, observed/predicted masks and SDFs, sorted z_obs,
+        z_new, and the original input-slice sorting order. ``cell_indices``
+        stores one (Ni, 2) array of [iy, ix] per target slice;
+        ``jitter_offsets`` stores the matching [dx, dy] physical offsets.
+        ``slice_index`` and ``slice_offsets`` locate sampled points in a
+        concatenation of sampled. Geometry metadata does not encode material
+        correspondence or feature values. z_operator contains the shared
+        apply_slice_z options; z_weights is available for data-linear operators
+        with global reliability (None for PCHIP/spatial reliability).
+        return_z_weights=False skips this optional matrix when it is not used.
+        The default return is unchanged.
+    """
+    methods = {"linear", "pchip", "cubic", "gaussian", "pspline"}
+    if method not in methods:
+        raise ValueError(f"method must be one of {sorted(methods)}.")
+
+    z_obs = np.asarray(z_obs, dtype=float).reshape(-1)
+    z_new = np.atleast_1d(np.asarray(z_new, dtype=float)).reshape(-1)
+
+    if len(z_obs) < 2 or len(points) != len(z_obs):
+        raise ValueError("At least two point slices matching z_obs are required.")
+
+    if len(z_new) == 0 and not return_info:
+        return []
+    if not np.all(np.isfinite(z_obs)) or not np.all(np.isfinite(z_new)):
+        raise ValueError("z_obs and z_new must contain finite positions.")
+
+    order = np.argsort(z_obs)
+    z_obs = z_obs[order]
+    points = [np.asarray(points[i], dtype=float) for i in order]
+    if any(p.ndim != 2 or p.shape[1] < 2 or len(p) == 0 for p in points):
+        raise ValueError("Each observed slice must be a nonempty (N, 2) array.")
+    points = [p[:, :2] for p in points]
+    if any(not np.all(np.isfinite(p)) for p in points):
+        raise ValueError("Observed xy coordinates must be finite.")
+
+    if np.any(np.diff(z_obs) <= 0):
+        raise ValueError("z_obs must contain unique positions.")
+
+    if len(z_new) and (z_new.min() < z_obs[0] or z_new.max() > z_obs[-1]):
+        raise ValueError("z_new must lie inside the observed z range.")
+
+    # Estimate the in-plane sampling scale from nearest-neighbor distances.
+    nn = [cKDTree(p).query(p, k=2)[0][:, 1] for p in points if len(p) > 1]
+    d = np.concatenate(nn) if nn else np.empty(0)
+    d = d[np.isfinite(d) & (d > 0)]
+    if not len(d):
+        raise ValueError("No positive within-slice XY spacing can be estimated.")
+    dxy = float(np.median(d))
+    
+    if np.isscalar(grid_scale):
+        dx = dy = float(grid_scale) * dxy
+    else:
+        dx, dy = np.array(grid_scale) * dxy
+    mask_radius = dxy * radius_scale
+    if not np.isfinite(dx) or not np.isfinite(dy) or dx <= 0 or dy <= 0:
+        raise ValueError("grid_scale must give positive finite grid spacing.")
+    if not np.isfinite(mask_radius) or mask_radius < 0:
+        raise ValueError("radius_scale must be finite and nonnegative.")
+
+    # One common physical xy grid is required before SDF interpolation.
+    xy = np.vstack(points)
+    xmin, ymin = xy.min(0)
+    xmax, ymax = xy.max(0)
+    x = np.arange(
+        np.floor(xmin / dx) * dx - margin * dx,
+        np.ceil(xmax / dx) * dx + (margin + 0.5) * dx,
+        dx,
+    )
+    y = np.arange(
+        np.floor(ymin / dy) * dy - margin * dy,
+        np.ceil(ymax / dy) * dy + (margin + 0.5) * dy,
+        dy,
+    )
+
+    # B_r = {(du, dv): du^2 + dv^2 <= r^2}.
+    rx = max(1, int(np.ceil(mask_radius / dx)))
+    ry = max(1, int(np.ceil(mask_radius / dy)))
+    xx = np.arange(-rx, rx + 1) * dx
+    yy = np.arange(-ry, ry + 1) * dy
+    structure = yy[:, None] ** 2 + xx[None, :] ** 2 <= mask_radius**2
+
+    masks_obs = []
+    for p in points:
+        ix = np.rint((p[:, 0] - x[0]) / dx).astype(int)
+        iy = np.rint((p[:, 1] - y[0]) / dy).astype(int)
+        valid = (ix >= 0) & (ix < len(x)) & (iy >= 0) & (iy < len(y))
+        mask = np.zeros((len(y), len(x)), dtype=bool)
+        mask[iy[valid], ix[valid]] = True
+
+        # Eq. (1): M1 = M0 (+) B_r;
+        #           M  = close(M1, B_r) = (M1 (+) B_r) (-) B_r.
+        mask = binary_dilation(mask, structure=structure)
+        if closing_iterations > 0:
+            mask = binary_closing(
+                mask,
+                structure=structure,
+                iterations=int(closing_iterations),
+            )
+        if fill_holes:
+            mask = binary_fill_holes(mask)
+        masks_obs.append(mask)
+    masks_obs = np.stack(masks_obs)
+
+    # Eq. (2): phi = d(x, outside) - d(x, inside); phi > 0 inside.
+    sdf_obs = np.stack(
+        [ distance_transform_edt(mask, sampling=(dy, dx)) - distance_transform_edt(~mask, sampling=(dy, dx))
+            for mask in masks_obs
+        ]
+    )
+    # Keep exactly the same z operator available to feature interpolation.
+    if reliability is None:
+        sorted_reliability = None
+    else:
+        sorted_reliability = np.asarray(reliability, dtype=float)
+        if sorted_reliability.ndim == 0:
+            sorted_reliability = np.full(len(z_obs), sorted_reliability.item())
+        elif sorted_reliability.shape[0] == len(z_obs) and sorted_reliability.size == len(z_obs):
+            sorted_reliability = sorted_reliability.reshape(len(z_obs))[order]
+        else:
+            sorted_reliability = np.broadcast_to(sorted_reliability, masks_obs.shape)[order]
+    z_operator = dict(method=method, smooth=smooth, delta=delta,
+                      n_basis=n_basis, degree=degree, z_bandwidth=z_bandwidth,
+                      reliability=sorted_reliability, chunk_size=chunk_size)
+    sdf_new = apply_slice_z(sdf_obs, z_obs, z_new, **z_operator)
+    z_weights = None
+    if return_info and return_z_weights and method != "pchip" and (sorted_reliability is None or sorted_reliability.ndim == 1):
+        z_weights = apply_slice_z(np.eye(len(z_obs)), z_obs, z_new, **z_operator)
+
+    masks_new = sdf_new > 0.0
+
+    # Preserve the median observed point density unless explicit counts are set.
+    if not sampling or n_points is None:
+        counts = masks_new.sum((1, 2))
+    elif isinstance(n_points, str):
+        area_obs = masks_obs.sum((1, 2)) * dx * dy
+        area_new = masks_new.sum((1, 2)) * dx * dy
+        density = np.median(
+            np.array([len(p) for p in points])
+            / np.maximum(area_obs, 1e-12)
+        )
+        counts = np.where(
+            area_new > 0,
+            np.maximum(1, np.rint(density * area_new).astype(int)),
+            0,
+        )
+    elif np.isscalar(n_points):
+        counts = np.full(len(z_new), int(n_points))
+    else:
+        counts = np.asarray(n_points, dtype=int)
+        if len(counts) != len(z_new):
+            raise ValueError("n_points must contain one count per z_new.")
+
+    rng = np.random.default_rng(random_state)
+    sampled, cell_indices, jitter_offsets = [], [], []
+    for i, (zi, mask, count) in enumerate(zip(z_new, masks_new, counts)):
+        iy, ix = np.where(mask)
+
+        if len(ix) == 0:
+            if sampling and count:
+                raise ValueError(
+                    f"The predicted mask at z={zi:g} is empty."
+                )
+
+            sampled.append(np.empty((0, 2)))
+            if return_info:
+                cell_indices.append(np.empty((0, 2), dtype=int))
+                jitter_offsets.append(np.empty((0, 2), dtype=float))
+            continue
+
+        if sampling:
+            choose = rng.choice( len(ix), size=int(count), replace=count > len(ix), )
+            ix = ix[choose]
+            iy = iy[choose]
+        else:
+            count = len(ix)
+
+        px = x[ix].copy()
+        py = y[iy].copy()
+
+        if jitter:
+            px += rng.uniform( -0.5 * dx, 0.5 * dx, int(count),)
+            py += rng.uniform( -0.5 * dy, 0.5 * dy, int(count),)
+
+        sampled.append(np.c_[px, py])
+        if return_info:
+            cell_indices.append(np.c_[iy, ix])
+            jitter_offsets.append(np.c_[px - x[ix], py - y[iy]])
+
+    if return_info:
+        lengths = np.array([len(p) for p in sampled], dtype=int)
+        info = dict(
+            x=x, y=y, dx=dx, dy=dy, dxy=dxy,
+            z_obs=z_obs, z_new=z_new, order=order,
+            masks_obs=masks_obs, sdf_obs=sdf_obs,
+            masks_new=masks_new, sdf_new=sdf_new,
+            cell_indices=cell_indices, jitter_offsets=jitter_offsets,
+            slice_index=np.repeat(np.arange(len(z_new)), lengths),
+            slice_offsets=np.r_[0, np.cumsum(lengths)],
+            method=method, z_operator=z_operator, z_weights=z_weights,
+            config=dict(
+                grid_scale=grid_scale, radius_scale=radius_scale, margin=margin,
+                closing_iterations=closing_iterations, fill_holes=fill_holes,
+                smooth=smooth, delta=delta, n_basis=n_basis, degree=degree,
+                z_bandwidth=z_bandwidth, reliability=reliability,
+                n_points=n_points, sampling=sampling, jitter=jitter,
+                random_state=random_state,
+            ),
+        )
+        result = sampled, info
+    else:
+        result = sampled
+    return result
+
 
 def pcd_grid(position, spacing = np.array([30., 30., 30.])):
     import numpy as np

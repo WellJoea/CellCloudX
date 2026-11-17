@@ -31,7 +31,7 @@ from ..nn._GATEconv import GATEConv
 from ..nn._utilis import seed_torch
 from ..nn._utilis import seed_torch, self_loop_check, loadData
 from ..nn._loss import loss_recon, loss_structure, loss_mse, loss_gae,loss_contrast,loss_soft_cosin
-from ..alignment.ccflib._sswnn import SSWNN, sswnn_match
+from ..alignment.m3lib._sswnn import SSWNN, sswnn_match
 from ..tools._spatial_edges import spatial_edges
 
 class GRAC():

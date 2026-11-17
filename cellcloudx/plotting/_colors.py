@@ -9,6 +9,8 @@ import plotly.graph_objects as go
 import scanpy as sc
 from matplotlib.colors import ListedColormap
 import matplotlib.colors as mcolors
+from matplotlib.colors import to_rgb, to_hex
+
 
 def colrows(ncell, nrows=None, ncols=None, soft=False):
     import math
@@ -164,6 +166,20 @@ def check_cmap( imaps):
         icmap = imaps
     return icmap
 
+
+def adjust_colors(colors, dark=0.25, light=0.35):
+    rgb = np.array([to_rgb(c) for c in colors])
+
+    dark_colors = [
+        to_hex(c * (1 - dark)) for c in rgb
+    ]
+    light_colors = [
+        to_hex(c + (1 - c) * light) for c in rgb
+    ]
+
+    return dark_colors, light_colors
+
+
 def cmap_legend(cmap, n, names=None, save=None, figsize=None, orantation='v'):
     icmap = check_cmap(cmap)
     if orantation == 'h':
@@ -232,21 +248,72 @@ def sccolor(adata, groupby):
     import scanpy as sc
     return sc.pl._tools.scatterplots._get_palette(adata, groupby)
 
-def rgb_to_hex(rgb):
-    if np.max(rgb) <=1 :
-        rgb = np.array(rgb) *255
-    rgb = np.round(rgb).astype(np.uint8)
-    assert np.max(rgb) <=255
+def rgb_to_hex0(rgb):
+    rgb = np.asarray(rgb)
+    
     if rgb.ndim == 1:
+        if np.max(rgb) <= 1:
+            rgb = rgb * 255
+        rgb = np.round(rgb).astype(np.uint8)
+        assert np.max(rgb) <= 255
         if len(rgb) == 3:
             return '#%02X%02X%02X' % tuple(rgb)
         elif len(rgb) == 4:
             return '#%02X%02X%02X%02X' % tuple(rgb)
         else:
             raise ValueError('rgb should be of length 3 or 4')
+    
     elif rgb.ndim == 2:
-        assert rgb.shape[1] == 3 or rgb.shape[1] == 4
-        return [ rgb_to_hex(i) for i in rgb ]
+        assert rgb.shape[1] in (3, 4), 'rgb should have 3 or 4 columns'
+        if np.max(rgb) <= 1.0:
+            rgb = rgb * 255.0
+        rgb = np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+
+        if rgb.shape[1] == 3:
+            packed = (rgb[:, 0].astype(np.uint32) << 16) | \
+                     (rgb[:, 1].astype(np.uint32) << 8)  | \
+                      rgb[:, 2].astype(np.uint32)
+            return [f'#{v:06X}' for v in packed]
+        else: 
+            packed = (rgb[:, 0].astype(np.uint32) << 24) | \
+                     (rgb[:, 1].astype(np.uint32) << 16) | \
+                     (rgb[:, 2].astype(np.uint32) << 8)  | \
+                      rgb[:, 3].astype(np.uint32)
+            return [f'#{v:08X}' for v in packed]
+    
+    else:
+        raise ValueError('Input must be 1D or 2D array')
+
+def rgb_to_hex(rgb):
+    rgb = np.asarray(rgb)
+
+    if rgb.ndim not in (1, 2):
+        raise ValueError("rgb must be a 1D or 2D array")
+    if rgb.shape[-1] not in (3, 4):
+        raise ValueError("rgb must have 3 or 4 channels")
+
+    if rgb.size and rgb.max() <= 1:
+        rgb = rgb * 255
+
+    rgb = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+    if rgb.ndim == 1:
+        return "#" + rgb.tobytes().hex().upper()
+
+    digits = np.frombuffer(b"0123456789ABCDEF", dtype=np.uint8)
+    n, c = rgb.shape
+
+    result = np.empty((n, 1 + 2 * c), dtype=np.uint8)
+    result[:, 0] = ord("#")
+    result[:, 1::2] = digits[rgb >> 4]
+    result[:, 2::2] = digits[rgb & 15]
+
+    return (
+        result.view(f"S{1 + 2 * c}")
+        .ravel()
+        .astype(f"U{1 + 2 * c}")
+    )
+
 def to_rgba(col):
     return mcolors.to_rgba(col)
 def to_rgb(col):
@@ -280,13 +347,14 @@ def hex_revers(value):
     return ('#%02x%02x%02x' % rgb)
     
 def hex_to_rgb(value, alpha=None):
-    # if mcolors.is_color_like(value)
-    value = value.strip("#") # removes hash symbol if present
-    lv = len(value)
-    rgbs = [ int(value[i:i + lv // 3], 16) for i in range(0, lv, lv // 3) ]
-    if not alpha is None:
-        rgbs = [*rgbs, alpha] 
-    return tuple(rgbs)
+    value = value.strip().lstrip("#")
+    if len(value) not in (6, 8):
+        raise ValueError("Color must be #RRGGBB or #RRGGBBAA")
+    rgb = tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    if alpha is None and len(value) == 8:
+        alpha = int(value[6:8], 16)
+    return (*rgb, alpha)
+    return rgb if alpha is None else (*rgb, alpha)
 
 def rgb_to_dec(value):
     return [v/256 for v in value]
@@ -336,6 +404,15 @@ def continuous_cmap(cor_list):
     >>>continuous_cmap(["lightgrey", "blue", "mediumblue",'red','yellow'])
     '''
     return matplotlib.colors.LinearSegmentedColormap.from_list("my_cmp", cor_list)
+
+def alpha_curve(x, center=0.65, sharpness=18, alpha_min=0.0, alpha_max=1.0):
+    x = np.asarray(x)
+    x = np.clip(x, 0, 1)
+    y = 1 / (1 + np.exp(-sharpness * (x - center)))
+    y0 = 1 / (1 + np.exp(-sharpness * (0 - center)))
+    y1 = 1 / (1 + np.exp(-sharpness * (1 - center)))
+    y = (y - y0) / (y1 - y0)
+    return alpha_min + (alpha_max - alpha_min) * y
 
 def merge_cmap(cmaps, ncolors=255, n_melt=11, clips=None):
     if isinstance(ncolors, int):
@@ -611,59 +688,66 @@ def random_colors0(n, seed=None):
     colors = ['#%06X' % color for color in colors]
     return colors
 
+
 import numpy as np
 
-def random_colors(n, min_dist=0.15, tohex=True, rgba=False, batch_size=50, max_attempts=100,
-                    seed = None, vmin=0, vmax=255):
-    m = 4 if rgba else 3
 
-    selected = np.empty((0, m))
-    attempts = 0
+def random_colors(
+    n, min_dist=0.15, tohex=True, rgba=False,
+    batch_size=50, max_attempts=100,
+    seed=None, vmin=0, vmax=255,
+):
+    rng = np.random.default_rng(seed)
+    k = n + batch_size * max_attempts
 
-    while len(selected) < n and attempts < max_attempts:
-        if seed is None:
-            rng = np.random.default_rng(seed = seed)
-        else:
-            rng = np.random.default_rng(seed = [seed, attempts])
-        candidates = rng.random((batch_size + n, m))
+    colors = (
+        np.column_stack([rng.permutation(k) for _ in range(3)])
+        + rng.random((k, 3))
+    ) / k
 
-        candidates = np.vstack([selected, candidates])
-        diff = candidates[:, np.newaxis, :] - candidates
-        dist = np.sqrt(np.sum(diff ** 2, axis=2))
-        dist += np.eye(dist.shape[0])*(1+min_dist)
+    selected = np.empty((n, 3))
+    dmin = np.full(k, np.inf)
+    idx = rng.integers(k)
+    actual_dist = np.inf
 
-        score = dist.sum(1)
-        valid_mask = np.all(dist >= min_dist, axis=1)
+    for i in range(n):
+        if i:
+            actual_dist = min(actual_dist, dmin[idx])
 
-        valid_candidates = candidates[valid_mask]
-        valid_score = score[valid_mask]
+        selected[i] = colors[idx]
+        dist = np.sum((colors - selected[i]) ** 2, axis=1)
+        dmin = np.minimum(dmin, dist)
+        dmin[idx] = -1
+        idx = np.argmax(dmin)
 
-        remaining = min(n, len(valid_candidates))
-        if valid_candidates.shape[0] > 0:
-            add_idx = np.argsort(valid_score)[::-1][:remaining]
-            selected =  valid_candidates[add_idx]
-        attempts += 1
+    actual_dist = np.sqrt(actual_dist)
+    if n > 1 and actual_dist < min_dist:
+        print(
+            f"minimum distance is {actual_dist:.3f}; "
+            "increase batch_size or max_attempts."
+        )
 
-    if len(selected) < n:
-        print(f'{len(selected)}: please increse max_attempts or decrese min_dist.')
-        candidates = rng.random((n-len(selected), m))
-        selected = np.vstack([selected, candidates])[:n]
+    if rgba:
+        selected = np.c_[selected, np.ones(n)]
 
-    if tohex:
-        finalcol = np.clip(selected*255, vmin, vmax).astype(int)
-        selected = []
-        for i in finalcol:
-            if len(i) == 3:
-                selected.append( '#%02X%02X%02X' % tuple(i))
-            elif len(i) == 4:
-                selected.append('#%02X%02X%02X%02X' % tuple(i) )
-    return selected
+    if not tohex:
+        return selected
 
-def color_palette(len_color, use_random=False):
+    selected = np.clip(
+        selected * 255, vmin, vmax
+    ).round().astype(np.uint8)
+
+    return [
+        "#" + "".join(f"{v:02X}" for v in color)
+        for color in selected
+    ]
+
+
+def color_palette(len_color, use_random=False, seed = None):
     #plt.colormaps()
     #plt.get_cmap('tab20')
     if use_random:
-         return random_colors(len_color)
+         return random_colors(len_color, seed=seed)
     if len_color <= 20:
         palette = sc.pl.palettes.default_20
     elif len_color <= 28:
@@ -673,6 +757,115 @@ def color_palette(len_color, use_random=False):
     elif len_color <= 150:  # 103 colors
         palette = longcolors(len_color)
     else:
-        palette = random_colors(len_color)
+        palette = random_colors(len_color, seed=seed)
 
     return palette[:len_color]
+
+
+def show_colors(
+    colors,
+    nrow=None,
+    ncol=None,
+    marker="o",
+    size=1600,
+    gap=1.0,
+    edgecolor="black",
+    linewidth=1.0,
+    linestyle="-",
+    names=None,
+    names_size=12,
+    names_pad=6,
+    figsize=None,
+    save=None,
+    dpi=1500,
+    transparent=True,
+    show=True,
+    pl=None,
+    names_pos="bottom",
+):
+    """Draw colors from left to right, then top to bottom.
+
+    nrow, ncol: Grid dimensions; missing values are inferred.
+    marker: Any Matplotlib scatter marker, e.g. 'o', 's', '^', 'D', 'h'.
+    size: Scatter marker size in points squared.
+    gap: Center spacing in data units; scalar or (horizontal, vertical).
+    edgecolor, linewidth, linestyle: Marker border settings.
+    names: One label per color, or None to hide labels.
+    names_pos: Label position: 'top', 'bottom', 'left', 'right', or 'center'.
+    names_size: Label font size in points.
+    names_pad: Padding from the marker border in points; ignored for 'center'.
+    figsize: Figure size in inches; used only when pl is None.
+    save: Output path or None; saves the entire figure.
+    dpi, transparent: Output resolution and background transparency.
+    show: Whether to call plt.show(). Use False when composing subplots.
+    pl: Existing Matplotlib Axes or None to create a new figure.
+    Returns: (fig, ax).
+    """
+    colors = list(colors)
+    n = len(colors)
+    if not n:
+        raise ValueError("colors must not be empty.")
+    if names is not None and len(names) != n:
+        raise ValueError("names and colors must have the same length.")
+    if nrow is None and ncol is None:
+        ncol = int(np.ceil(np.sqrt(n)))
+    if nrow is None:
+        nrow = int(np.ceil(n / ncol))
+    if ncol is None:
+        ncol = int(np.ceil(n / nrow))
+    if nrow * ncol < n:
+        raise ValueError("nrow * ncol must be at least len(colors).")
+
+    dx, dy = np.broadcast_to(gap, (2,))
+    row, col = np.divmod(np.arange(n), ncol)
+    x, y = col * dx, (nrow - 1 - row) * dy
+    width = (ncol - 1) * dx + 1
+    height = (nrow - 1) * dy + 1
+
+    if pl is None:
+        if figsize is None:
+            figsize = (max(2, width * 1.1), max(1.5, height * 1.1 + 0.5))
+        fig, ax = plt.subplots(figsize=figsize, facecolor="white")
+    else:
+        ax = pl
+        fig = ax.figure
+
+    points = ax.scatter(
+        x, y,
+        c=colors, s=size, marker=marker,
+        edgecolors="none" if edgecolor is None else edgecolor,
+        linewidths=linewidth, linestyles=linestyle, clip_on=False,
+    )
+    ax.set(xlim=(-0.5, width - 0.5), ylim=(-0.5, height - 0.5), aspect="equal")
+    ax.set_axis_off()
+    if names is not None:
+        # Marker boundary, padding direction, and text alignment.
+        box = points.get_paths()[0].get_extents()
+        positions = {
+            "top":    ((0, box.y1), (0, 1), "center", "bottom"),
+            "bottom": ((0, box.y0), (0, -1), "center", "top"),
+            "left":   ((box.x0, 0), (-1, 0), "right", "center"),
+            "right":  ((box.x1, 0), (1, 0), "left", "center"),
+            "center": ((0, 0), (0, 0), "center", "center"),
+        }
+        if names_pos not in positions:
+            raise ValueError("names_pos must be 'top', 'bottom', 'left', 'right', or 'center'.")
+        edge, direction, ha, va = positions[names_pos]
+        scales = np.broadcast_to(np.sqrt(size), (n,))[:, None]
+        offsets = scales * edge + (linewidth / 2 + names_pad) * np.asarray(direction)
+        for xi, yi, name, offset in zip(x, y, names, offsets):
+            ax.annotate(
+                str(name), (xi, yi), xytext=offset,
+                textcoords="offset points", ha=ha, va=va,
+                fontsize=names_size,
+            )
+    if pl is None:
+        fig.tight_layout(pad=0.4)
+
+    if save:
+        fig.savefig(save, dpi=dpi, bbox_inches="tight", pad_inches=0.05,
+                    transparent=transparent)
+    if show:
+        plt.show()
+    return fig, ax
+

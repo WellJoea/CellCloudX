@@ -53,7 +53,7 @@ class DiffExp:
     def degsc(self, clumethod, degmethod='wilcoxon', min_in_group_fraction=0,
               only_filter=False,
               min_fold_change=0.25, max_out_group_fraction=1, use_raw=True, 
-              pvals=0.05, fc=0.1, **kargs):
+              pvals=0.05, fc=0.1, fkargs={}, **kargs):
         if 'log1p' in self.adata.uns.keys():
             del self.adata.uns['log1p']
         if not only_filter:
@@ -62,14 +62,14 @@ class DiffExp:
                                     method=degmethod,
                                     key_added = degmethod, 
                                     use_raw=use_raw, 
-                                    pts =True)
+                                    pts =True, **kargs)
         sc.tl.filter_rank_genes_groups(self.adata, 
                                     key=degmethod, 
                                     key_added=degmethod+'_filtered', 
                                     min_in_group_fraction=min_in_group_fraction,
                                     min_fold_change=min_fold_change,
                                     max_out_group_fraction=max_out_group_fraction,
-                                    **kargs)
+                                    **fkargs)
         self.deg_table( unigroup=degmethod+'_filtered',  pvals=pvals, fc=fc, 
                   n_jobs=5, backend='threading',
                   order=['logfoldchanges'])

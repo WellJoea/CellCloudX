@@ -18,8 +18,7 @@ from matplotlib import pyplot as plt
 import scanpy as sc
 
 import sys
-sys.path.append('/gpfs/home/user19/JupyterCode/')
-from CellCloudX_v126 import cellcloudx as cc
+from .. import cellcloudx as cc
 
 def pair_gl(X, Y, Xf, Yf, xlabels=None, knn=1, radius=None, ylabels=None, alpha=0.5, use_mnn=False, temp=[1,1], CI=1.0):
     from scipy import stats

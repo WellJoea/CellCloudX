@@ -258,7 +258,7 @@ def fix_mesh(mesh: PolyData) -> PolyData:
         )
 
     meshfix = mf.MeshFix(mesh)
-    meshfix.repair(verbose=False)
+    meshfix.repair()
     fixed_mesh = meshfix.mesh.triangulate().clean()
 
     if fixed_mesh.n_points == 0:

@@ -18,7 +18,7 @@ from ._search import searchidx
 from ..plotting._imageview import drawMatches
 from ..utilis._arrays import list_iter
 from ..utilis._arrays import list_iter, vartype
-from ..alignment.ccflib.xmm import kernel_xmm_k
+from ..alignment.m3lib.xmm import kernel_xmm_k
 
 
 

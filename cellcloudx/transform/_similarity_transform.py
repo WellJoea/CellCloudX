@@ -1,4 +1,5 @@
 import numpy as np
+import math
 from skimage.transform import  EuclideanTransform
 from skimage.transform._geometric import _euler_rotation_matrix
 
@@ -90,7 +91,7 @@ class SimilarityTransform(EuclideanTransform):
         elif self.params is None:
             # default to an identity transform
             self.params = np.eye(dimensionality + 1)
-
+    
     def estimate(self, src, dst):
         """Estimate the transformation from a set of corresponding points.
 
@@ -114,9 +115,25 @@ class SimilarityTransform(EuclideanTransform):
         """
 
         self.params = _umeyama(src, dst, estimate_scale=True, isoscale=self.isoscale)
-
         # _umeyama will return nan if the problem is not well-conditioned.
         return not np.any(np.isnan(self.params))
+
+    @property
+    def rotation(self):
+        return self.params[:self.dimensionality,:self.dimensionality]/self.scale
+        if self.dimensionality == 2:
+            return math.atan2(self.params[1, 0], self.params[1, 1])
+        elif self.dimensionality == 3:
+            # Returning 3D Euler rotation matrix
+            return self.params[:3, :3]/self.scale
+        else:
+            raise NotImplementedError(
+                'Rotation only implemented for 2D and 3D transforms.'
+            )
+
+    @property
+    def translation(self):
+        return self.params[0 : self.dimensionality, self.dimensionality]
 
     @property
     def scale(self):

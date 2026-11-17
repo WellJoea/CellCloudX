@@ -115,8 +115,6 @@ def clipdata(Data, vmin=None, vmax=None, pmin=None, pmax=None,  clips=None, tmin
         Data[Data<vmin] = tmin
 
 
-    
-
     if not clips is None:
         if isinstance(Data, (pd.DataFrame, pd.Series)):
             Data = Data.clip(clips[0], clips[1])
@@ -125,6 +123,26 @@ def clipdata(Data, vmin=None, vmax=None, pmin=None, pmax=None,  clips=None, tmin
 
         Data = np.clip(Data, vmin, vmax)
     return Data
+
+def get_minmax(Data, vmin=None, vmax=None, pmin=None, pmax=None):
+    if not pmin is None:
+        pvmin = np.percentile(Data, pmin)
+        if vmin is None:
+            vmin = pvmin
+        else:
+            vmin = max(vmin, pvmin)
+    if not pmax is None:
+        pvmax = np.percentile(Data, pmax)
+        if vmax is None:
+            vmax = pvmax
+        else:
+            vmax = min(vmax, pvmax)
+    if vmin is None:
+        vmin = np.min(Data)
+    if vmax is None:
+        vmax = np.max(Data)
+    return vmin, vmax
+
 
 def image2batyes(image, scale=True):
     if scale and (image.max()>255):

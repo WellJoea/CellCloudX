@@ -191,7 +191,7 @@ class matplt3d:
                 ani.save(save, writer=writer, dpi=dpi)
             self.ani = ani
 
-def lineMatches3D(matches, bgs=None, groupby=None, line_cmap = 'viridis',
+def lineMatches3D_mp(matches, bgs=None, groupby=None, line_cmap = 'viridis',
                   line_color='gray',  line_width=1, line_alpha = 1, color='b',
                    line_weight = None, figsize = (10,10),
                    axislabel='Dim', title=None,

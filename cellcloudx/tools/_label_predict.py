@@ -15,6 +15,322 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, AgglomerativeClustering, DBSCAN, SpectralClustering
 
+
+
+"""Spatial label refinement on an arbitrary 2D/3D point cloud.
+
+Dependencies: numpy, scipy. CPU implementation; no mesh or training required.
+
+    from label_refine import refine_labels
+    new_label, score = refine_labels(points, label)
+    new_label, score, info = refine_labels(points, label, return_info=True)
+
+The original labels define a fixed unary term. A distance-limited symmetric
+kNN graph defines a joint multiclass graph-TV relaxation of the Potts model.
+No points or small components are deleted. Scores are local conditional model
+probabilities, NOT calibrated probabilities of biological correctness.
+"""
+
+import warnings
+
+import numpy as np
+from scipy import sparse
+from scipy.spatial import cKDTree
+from scipy.special import softmax
+
+
+
+def _spatial_graph(points, k, max_distance, axis_scale, feature,
+                   feature_scale, workers):
+    """Return symmetric CSR weights, normalized to median positive degree 1."""
+    n = len(points)
+    if n < 2:
+        return sparse.csr_matrix((n, n)), max_distance
+    x = (points - points.mean(axis=0)) / axis_scale
+    k = min(k, n - 1)
+    distance, index = cKDTree(x).query(x, k=k + 1, workers=workers)
+    # Self is not necessarily the first result when coordinates are duplicated.
+    distance[index == np.arange(n)[:, None]] = np.inf
+    order = np.argsort(distance, axis=1, kind="stable")[:, :k]
+    distance = np.take_along_axis(distance, order, axis=1)
+    index = np.take_along_axis(index, order, axis=1)
+    h = distance[:, -1].copy()
+    positive = h[h > 0]
+    reference = float(np.median(positive)) if positive.size else 1.0
+    h = np.clip(h, 0.25 * reference, 1.5 * reference)
+    radius = 1.5 * reference if max_distance is None else max_distance
+    row = np.repeat(np.arange(n), k)
+    col = index.ravel()
+    d = distance.ravel()
+    keep = d <= radius
+    row, col, d = row[keep], col[keep], d[keep]
+    weight = np.exp(-0.5 * (d / h[row]) * (d / h[col]))
+    if feature is not None and row.size:
+        # Accumulate by column to avoid allocating an (N*k, n_features) array.
+        fd2 = np.zeros(row.size)
+        for f in feature.T:
+            fd2 += (f[row] - f[col]) ** 2
+        if feature_scale is None:
+            positive = fd2[fd2 > 0]
+            scale2 = float(np.median(positive)) if positive.size else 1.0
+        else:
+            scale2 = feature_scale ** 2
+        weight *= np.exp(-0.5 * fd2 / scale2)
+    graph = sparse.csr_matrix((weight, (row, col)), shape=(n, n))
+    graph = graph.maximum(graph.T).tocsr()
+    graph.setdiag(0)
+    graph.eliminate_zeros()
+    degree = np.asarray(graph.sum(axis=1)).ravel()
+    if np.any(degree > 0):
+        graph.data /= np.median(degree[degree > 0])
+    return graph, radius
+
+
+def _simplex(v):
+    """Euclidean projection of each row onto {u >= 0, sum(u) = 1}."""
+    ordered = np.sort(v, axis=1)[:, ::-1]
+    cumulative = np.cumsum(ordered, axis=1) - 1.0
+    count = np.sum(ordered > cumulative / np.arange(1, v.shape[1] + 1), axis=1)
+    threshold = cumulative[np.arange(len(v)), count - 1] / count
+    return np.maximum(v - threshold[:, None], 0.0)
+
+
+def _graph_tv(graph, cost, original, fixed, smooth, max_iter, tol):
+    """Chambolle-Pock solver; stop on the primal-dual gap per point."""
+    n, classes = cost.shape
+    u = np.zeros_like(cost)
+    u[np.arange(n), original] = 1.0
+    if not graph.nnz or smooth == 0 or classes == 1:
+        return u, 0, True, 0.0
+    edge = sparse.triu(graph, k=1, format="coo")
+    m = len(edge.data)
+    incidence = sparse.csr_matrix(
+        (np.tile([-1.0, 1.0], m),
+         (np.repeat(np.arange(m), 2),
+          np.column_stack((edge.row, edge.col)).ravel())),
+        shape=(m, n),
+    )
+    transpose = incidence.T.tocsr()
+    limit = (0.5 * smooth * edge.data)[:, None]
+    step = 0.99 / np.sqrt(2.0 * np.max(np.diff(graph.indptr)))
+    dual = np.zeros((m, classes))
+    extrapolated = u.copy()
+    fixed_index = np.flatnonzero(fixed)
+    gap = np.inf
+    for iteration in range(1, max_iter + 1):
+        dual += step * (incidence @ extrapolated)
+        np.clip(dual, -limit, limit, out=dual)
+        gradient = cost + transpose @ dual
+        updated = _simplex(u - step * gradient)
+        updated[fixed_index] = 0.0
+        updated[fixed_index, original[fixed_index]] = 1.0
+        extrapolated = 2.0 * updated - u
+        u = updated
+        if iteration % 20 == 0 or iteration == max_iter:
+            primal = np.sum(cost * u) + np.sum(limit * np.abs(incidence @ u))
+            lower = np.min(gradient, axis=1)
+            lower[fixed_index] = gradient[fixed_index, original[fixed_index]]
+            gap = max(0.0, float(primal - lower.sum()) / n)
+            if gap <= tol:
+                break
+    return u, iteration, gap <= tol, gap
+
+
+def refine_labels(points, label, *, k=20, smooth=3.0, confidence=0.8,
+                  max_distance=None, axis_scale=1.0, feature=None,
+                  feature_scale=None, fixed=None, max_iter=500, tol=1e-4,
+                  workers=-1, return_info=False):
+    """Correct scattered labels and regularize boundaries jointly.
+
+    Parameters
+    ----------
+    points : array-like, (N, 2) or (N, 3)
+        Finite coordinates; their order and positions are unchanged.
+    label : array-like, (N,)
+        String or numeric labels, including pandas Series/Categorical inputs.
+        Missing labels are not supported. Output is a NumPy array retaining
+        the input label values and dtype (not the pandas categorical metadata).
+    k : int, default=20
+        Number of candidate neighbors per point. Symmetrization can increase
+        a node's final degree. Larger values may join across thin structures.
+    smooth : float >= 0, default=3.0
+        Graph-TV/Potts strength. Larger values remove more fragments but may
+        erase thin/rare regions. Zero returns the original labels exactly.
+        Edge weights have median positive weighted degree 1; this is not
+        physical volume/area normalization.
+    confidence : float or (N,) array, default=0.8
+        Assumed reliability of each ORIGINAL label. For C > 1, values must
+        satisfy 1/C <= confidence < 1. Remaining mass is shared equally among
+        the other C-1 classes. It stays fixed throughout optimization. Use
+        higher values, e.g. 0.95-0.99, to protect trusted labels, or fixed for
+        exact anchors. This is an assumed prior, not estimated accuracy.
+    max_distance : positive float or None, default=None
+        Maximum edge length AFTER division by axis_scale. At axis_scale=1 it
+        is in the original coordinate units. None uses 1.5 times the median
+        positive kth-neighbor distance. No long edge is added to connect an
+        isolated point. An explicit limit is preferable for known cavities.
+    axis_scale : positive float or (D,) array, default=1.0
+        Coordinates used for neighbor search are points/axis_scale. For 3D,
+        (1, 1, 2) makes a z separation count half as much. This changes graph
+        connectivity; it neither moves points nor reconstructs missing slices.
+    feature : array-like, (N, F), optional
+        Finite, already standardized low-dimensional expression/image features.
+        Dissimilar features weaken an edge. No model is trained. Prefer a
+        small embedding; sparse full gene matrices should be reduced first.
+    feature_scale : positive float or None, default=None
+        Gaussian feature distance scale. None uses the median positive feature
+        distance of candidate edges. Smaller values protect feature boundaries
+        more strongly; larger values make feature differences less influential.
+    fixed : bool array, (N,), optional
+        True fixes that point to its original label. Its returned score is 1
+        by the imposed constraint, not by independently measured certainty.
+    max_iter : positive int, default=500
+        Maximum iterations of the convex relaxation. If the gap remains above
+        tol, return the current approximation and issue a RuntimeWarning.
+    tol : positive float, default=1e-4
+        Primal-dual gap tolerance per point. Increasing max_iter improves solver
+        convergence; it is not a substitute for increasing smooth.
+    workers : int, default=-1
+        cKDTree workers; -1 uses all available CPU threads.
+    return_info : bool, default=False
+        Also return class-wise conditional scores and solver diagnostics.
+
+    Returns
+    -------
+    new_label : ndarray, (N,)
+        Labels from the graph-TV relaxation, rounded jointly with argmax.
+        Exact ties prefer the original label. No points are deleted.
+    score : ndarray, (N,)
+        In [0, 1], the conditional score of the RETURNED label:
+        softmax_c(log(q_i(c)) + smooth * sum_j w_ij [new_label_j == c]).
+        It conditions on final neighbor labels; it is not a calibrated
+        correctness probability. An isolated point retains its original label
+        and prior score. With only one observed class the score is 1.
+    info : dict, only if return_info=True
+        classes: class values for columns of probabilities;
+        probabilities: (N,C) conditional model scores, not TV variables;
+        margin: selected score minus the largest alternative score (may be
+        negative: TV rounding need not maximize the local conditional score);
+        changed: (N,) bool; iterations, converged, duality_gap, max_distance.
+
+    Notes
+    -----
+    The convex relaxation has objective
+        sum_i,c D_i(c)*U_i(c) + smooth/2 * sum_{i<j} w_ij*|U_i-U_j|_1,
+    with U_i in the probability simplex and D=-log(q). Its rounded multiclass
+    solution is approximate. Convergence refers to the relaxation, not the
+    discrete global optimum or biological correctness. Use reliable evidence
+    to distinguish real scattered cells from erroneous labels.
+    Memory is O(N*k*C); each solver iteration is O(N*k*C + N*C*log(C)).
+
+    Examples
+    --------
+    >>> new_label, score = refine_labels(points, label)  # doctest: +SKIP
+    >>> new_label, score, info = refine_labels(  # doctest: +SKIP
+    ...     points, label, smooth=4.0, return_info=True)
+    """
+    x = np.asarray(points, dtype=float)
+    labels = np.asarray(label)
+    if x.ndim != 2 or x.shape[1] not in (2, 3) or not np.isfinite(x).all():
+        raise ValueError("points must be a finite (N, 2) or (N, 3) array.")
+    n = len(x)
+    if labels.ndim != 1 or len(labels) != n:
+        raise ValueError("label must be a one-dimensional array of length N.")
+    if labels.dtype.kind in "fc" and not np.isfinite(labels).all():
+        raise ValueError("label cannot contain missing or infinite values.")
+    if labels.dtype.kind == "O" and any(
+        v is None or (isinstance(v, (float, np.floating)) and not np.isfinite(v))
+        for v in labels
+    ):
+        raise ValueError("label cannot contain missing values.")
+    try:
+        classes, original = np.unique(labels, return_inverse=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Use nonmissing string labels or homogeneous numeric labels.") from exc
+    c = len(classes)
+    if not isinstance(k, (int, np.integer)) or k < 1:
+        raise ValueError("k must be a positive integer.")
+    if not np.isfinite(smooth) or smooth < 0:
+        raise ValueError("smooth must be finite and >= 0.")
+    if not isinstance(max_iter, (int, np.integer)) or max_iter < 1:
+        raise ValueError("max_iter must be a positive integer.")
+    if not np.isfinite(tol) or tol <= 0:
+        raise ValueError("tol must be finite and > 0.")
+    if max_distance is not None and (not np.isfinite(max_distance) or max_distance <= 0):
+        raise ValueError("max_distance must be finite and > 0, or None.")
+    if feature_scale is not None and (not np.isfinite(feature_scale) or feature_scale <= 0):
+        raise ValueError("feature_scale must be finite and > 0, or None.")
+    axes = np.broadcast_to(np.asarray(axis_scale, dtype=float), (x.shape[1],))
+    if not np.isfinite(axes).all() or np.any(axes <= 0):
+        raise ValueError("axis_scale must be positive and finite.")
+    reliability = np.broadcast_to(np.asarray(confidence, dtype=float), (n,))
+    if not np.isfinite(reliability).all() or np.any((reliability < 0) | (reliability > 1)):
+        raise ValueError("confidence must be finite and in [0, 1].")
+    if c > 1 and np.any((reliability < 1.0 / c) | (reliability >= 1)):
+        raise ValueError("For C>1, confidence must be >=1/C and <1; use fixed for anchors.")
+    anchors = np.zeros(n, dtype=bool) if fixed is None else np.asarray(fixed)
+    if anchors.shape != (n,) or anchors.dtype.kind != "b":
+        raise ValueError("fixed must be a boolean array of length N.")
+    if feature is not None:
+        feature = np.asarray(feature, dtype=float)
+        if feature.ndim != 2 or feature.shape[0] != n or not np.isfinite(feature).all():
+            raise ValueError("feature must be a finite (N, F) array.")
+    rows = np.arange(n)
+    if c <= 1:
+        probabilities = np.ones((n, c))
+        score = np.ones(n)
+        updated = original.copy()
+        iterations, converged, gap, radius = 0, True, 0.0, max_distance
+    else:
+        prior = np.broadcast_to(((1.0 - reliability) / (c - 1))[:, None], (n, c)).copy()
+        prior[rows, original] = reliability
+        log_prior = np.log(prior)
+        cost = -log_prior
+        cost -= cost.min(axis=1, keepdims=True)
+        if smooth == 0:
+            graph, radius = sparse.csr_matrix((n, n)), max_distance
+        else:
+            graph, radius = _spatial_graph(
+                x, k, max_distance, axes, feature, feature_scale, workers)
+        u, iterations, converged, gap = _graph_tv(
+            graph, cost, original, anchors, smooth, max_iter, tol)
+        updated = u.argmax(axis=1)
+        ties = u[rows, original] >= u.max(axis=1) - 1e-10
+        updated[ties] = original[ties]
+        updated[anchors] = original[anchors]
+        isolated = np.diff(graph.indptr) == 0
+        updated[isolated] = original[isolated]
+        membership = sparse.csr_matrix((np.ones(n), (rows, updated)), shape=(n, c))
+        support = (graph @ membership).toarray()
+        probabilities = softmax(log_prior + smooth * support, axis=1)
+        probabilities[anchors] = 0.0
+        probabilities[rows[anchors], original[anchors]] = 1.0
+        score = probabilities[rows, updated]
+        if not converged:
+            warnings.warn(
+                "graph-TV reached max_iter; duality gap per point is %.3g "
+                "(tol=%.3g). Increase max_iter if needed." % (gap, tol),
+                RuntimeWarning, stacklevel=2)
+    result = labels.copy()
+    if n:
+        result[:] = classes[updated]
+    if not return_info:
+        return result, score
+    if c > 1:
+        second = np.partition(probabilities, -2, axis=1)[:, -2]
+        best = probabilities.max(axis=1)
+        alternative = np.where(updated == probabilities.argmax(axis=1), second, best)
+        margin = score - alternative
+    else:
+        margin = score.copy()
+    info = dict(classes=classes, probabilities=probabilities, margin=margin,
+                changed=result != labels, iterations=iterations,
+                converged=converged, duality_gap=gap, max_distance=radius)
+    return result, score, info
+
+
+
+
 def cluster(X, F,  k=6, alpha=[0.5, 0.5],  beta=[0.1,5,], 
             temp=2, knn=None, method= ['kmeans', 'leiden'],
             pnt = 64,

@@ -5,9 +5,6 @@ import pandas as pd
 import numpy as np
 from anndata import AnnData
 
-import leidenalg as la
-import igraph as ig
-
 def cutsne():
     import cudf
     import cuml
@@ -256,7 +253,7 @@ def merge_small_cluster(partition, optimiser=None, min_comm_size=100, max_comm_n
     return partition
 
 def leiden_graph(
-    G: ig.Graph ,
+    G,
     drop_neg_weights=False,
     graph_type=None,
     resolution: float = 1,
@@ -270,10 +267,10 @@ def leiden_graph(
     min_comm_size: int = None,
     layer_weights=None,
     is_membership_fixed=None,
-    partition_type: la.VertexPartition.MutableVertexPartition = None,
+    partition_type = None,
     **partition_kwargs,
 ) -> np.array:
-
+    import leidenalg as la
     if graph_type == 'multiplex':
         drop_neg_weights = False
         G_pos = G.subgraph_edges(G.es.select(weight_gt = 0), delete_vertices=False)
